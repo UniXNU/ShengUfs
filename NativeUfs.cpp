@@ -7,6 +7,11 @@
 #include <libkern/crypto/sha2.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_map.h>
+/* Newer XNU keeps the kernel memory and map protection interfaces in these headers. */
+#if __has_include(<vm/vm_kern_xnu.h>)
+#include <vm/vm_kern_xnu.h>
+#endif
+#include <mach/mach_vm.h>
 #include <sys/param.h>
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
 #include "verified_root.h"
@@ -1690,8 +1695,8 @@ bool NativeUfsBlock::configureVerification ()
   uint8_t *key = reinterpret_cast<uint8_t *> (verifiedStorage + tableBytes);
   memcpy (key, verified_root_key, VR_KEY_BYTES);
   gRootDiagnostic.stage = "policy read-only protection";
-  if (vm_map_protect (kernel_map, verifiedStorage, verifiedStorage + verifiedStorageBytes,
-                      VM_PROT_READ, TRUE) != KERN_SUCCESS) {
+  if (mach_vm_protect (kernel_map, verifiedStorage, verifiedStorageBytes,
+                       TRUE, VM_PROT_READ) != KERN_SUCCESS) {
     return false;
   }
   gRootDiagnostic.stage = "owner signature and hash table";
