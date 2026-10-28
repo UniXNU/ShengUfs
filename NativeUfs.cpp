@@ -46,7 +46,13 @@ static void rootDiagnosticFailure (const char *reason);
 extern "C" {
 // Optional passive observer; absent in ordinary builds. It may run while a
 // window lock is held, so its contract forbids blocking or transport access.
+#if defined(NATIVE_UFS_SOURCE_API) && NATIVE_UFS_SOURCE_API
+// The source runtime archive carries a weak no-op definition; a weak
+// reference here would become an unresolved pointer-auth import instead.
+void boot_progress_poll (void);
+#else
 void boot_progress_poll (void) __attribute__((weak));
+#endif
 volatile uint32_t native_ufs_probe_calls = 0;
 volatile uint32_t native_ufs_matched = 0;
 volatile uint32_t native_ufs_probe_requested = 0;
@@ -1514,6 +1520,13 @@ extern "C" int native_ufs_log_sync (void)
   return gLogRegionBlocks && hostSyncCache () == kIOReturnSuccess;
 }
 
+// From a panic, before the log writes that keep its message: later host commands no longer wait on the host lock. 1 = the log is open.
+extern "C" int native_ufs_log_panic (void)
+{
+  gHostPanic = true;
+  return gLogRegionBlocks != 0;
+}
+
 // Re-read the GPT header and entry array and compare their CRCs with what was recorded at root start. 0 = unchanged.
 extern "C" unsigned native_ufs_store_gpt_check (void)
 {
@@ -1578,6 +1591,15 @@ public:
 };
 OSDefineMetaClassAndStructors (NativeUfsBlock, IOBlockStorageDevice)
 
+#if defined(NATIVE_UFS_SOURCE_API) && NATIVE_UFS_SOURCE_API
+// The source runtime owns registration and attachment after IOStorageFamily
+// has loaded. No second IOKit personality starts this service in that mode.
+extern "C" IOService *native_ufs_source_create (void)
+{
+  return new NativeUfs;
+}
+#endif
+
 extern "C" {
 volatile uint32_t native_ufs_blocks_published = 0;
 volatile uint64_t native_ufs_block_reads = 0;
@@ -1635,8 +1657,36 @@ bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint6
 #endif
 }
 
+// Data objects of the root image (version 2 manifest), recorded by startRoot before windows are configured.
+static RootWindow gRootObject[4];
+static uint32_t gRootObjects;
+static uint64_t gRootObjectBase;
+
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
 volatile uint64_t native_ufs_verified_blocks = 0;
+
+// Read the hash table of a header-only policy from the root image object "<window>.vroot" into `table`.
+// The bytes are untrusted here; vr_open checks them against the digest in the signed header.
+static bool readPolicyTable (const char *window, uint8_t *table, uint64_t tableBytes)
+{
+  char name[32];
+  if (snprintf (name, sizeof (name), "%s.vroot", window) >= static_cast<int> (sizeof (name))) return false;
+  const RootWindow *object = nullptr;
+  for (unsigned i = 0; i < gRootObjects; ++i)
+    if (!strcmp (gRootObject[i].name, name)) object = &gRootObject[i];
+  if (!object || object->size != tableBytes) return false;
+  uint64_t lba = (gRootObjectBase + object->offset) / 4096, done = 0;
+  while (done < tableBytes) {
+    uint64_t left = tableBytes - done;
+    uint32_t blocks = static_cast<uint32_t> (left >= kDataMax ? kDataMax / 4096 : (left + 4095) / 4096);
+    if (hostRead4k (0, lba, blocks, gScratch) != kIOReturnSuccess) return false;
+    uint64_t take = left < blocks * 4096ULL ? left : blocks * 4096ULL;
+    memcpy (table + done, gScratch, take);
+    done += take;
+    lba += blocks;
+  }
+  return true;
+}
 // Time spent hashing/verifying and reading from the UFS transport, in generic-timer ticks (diagnostic only).
 volatile uint64_t native_ufs_verify_ticks = 0, native_ufs_read_ticks = 0;
 static inline uint64_t timerTicks (void) {uint64_t v; __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (v)); return v;}
@@ -1679,6 +1729,19 @@ bool NativeUfsBlock::configureVerification ()
     gRootDiagnostic.stage = "no capacity-matching policy";
     return false;
   }
+  // A header-only policy carries its hash table in the root image instead of the boot image.
+  const bool headerOnly = manifestBytes == VR_HEADER_BYTES + VR_SIGNATURE_BYTES;
+  uint64_t hashBytes = 0;
+  if (headerOnly) {
+    uint64_t count = 0;
+    for (unsigned i = 0; i < 8; ++i) count |= static_cast<uint64_t> (manifest[32 + i]) << (8 * i);
+    if (!count || count > (UINT64_MAX - manifestBytes) / 32) {
+      gRootDiagnostic.stage = "policy header block count";
+      return false;
+    }
+    hashBytes = count * 32;
+    manifestBytes += hashBytes;
+  }
   gRootDiagnostic.stage = "policy storage";
   vm_size_t tableBytes = round_page (static_cast<vm_size_t> (manifestBytes));
   if (tableBytes < manifestBytes || tableBytes > UINT64_MAX - 4096) {
@@ -1691,7 +1754,16 @@ bool NativeUfsBlock::configureVerification ()
                   static_cast<kma_flags_t> (KMA_KOBJECT | KMA_DATA), VM_KERN_MEMORY_SECURITY) != KERN_SUCCESS) {
     return false;
   }
-  memcpy (reinterpret_cast<void *> (verifiedStorage), manifest, manifestBytes);
+  if (headerOnly) {
+    memcpy (reinterpret_cast<void *> (verifiedStorage), manifest, VR_HEADER_BYTES + VR_SIGNATURE_BYTES);
+    gRootDiagnostic.stage = "policy table object read";
+    if (!readPolicyTable (label, reinterpret_cast<uint8_t *> (verifiedStorage) + VR_HEADER_BYTES + VR_SIGNATURE_BYTES,
+                          hashBytes)) {
+      return false;
+    }
+  } else {
+    memcpy (reinterpret_cast<void *> (verifiedStorage), manifest, manifestBytes);
+  }
   uint8_t *key = reinterpret_cast<uint8_t *> (verifiedStorage + tableBytes);
   memcpy (key, verified_root_key, VR_KEY_BYTES);
   gRootDiagnostic.stage = "policy read-only protection";
@@ -1815,7 +1887,11 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
         return kIOReturnNotPrivileged;
       }
       __atomic_fetch_add (&native_ufs_verified_blocks, 1, __ATOMIC_RELAXED);
+#if defined(NATIVE_UFS_SOURCE_API) && NATIVE_UFS_SOURCE_API
+      boot_progress_poll ();
+#else
       if (boot_progress_poll) boot_progress_poll ();
+#endif
 #else
       (void) index; (void) data; (void) length;
 #endif
@@ -2203,6 +2279,9 @@ bool NativeUfs::startRoot (IOService *provider)
   }
   gStoreGeometry = { true, layout->userdataFirst, layout->userdataLast, layout->imageBytes, layout->gptEntriesLba,
                      layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount };
+  gRootObjects = layout->objects;
+  for (unsigned i = 0; i < layout->objects; ++i) gRootObject[i] = layout->object[i];
+  gRootObjectBase = layout->userdataFirst * 4096ULL;
   const char *names[4] = {};
   for (unsigned i = 0; i < layout->windows; ++i) names[i] = layout->window[i].name;
   if (!ufsBuildRootPlan (names, layout->windows, gPublicationPlan)) {
