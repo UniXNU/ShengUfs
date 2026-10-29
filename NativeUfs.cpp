@@ -1315,34 +1315,6 @@ extern "C" int native_ufs_store_read (uint64_t rel, uint32_t blocks, void *dst)
   return 1;
 }
 
-// ---- Import region (read only) -------------------------------------------------------------------------------------
-// The part of the reserve at the end of userdata that neither the log nor its export region uses: from the reserve's first block up
-// to a 1 MiB guard below the export region. The host writes it with a sparse image that touches nothing else (UniXNU-sheng
-// scripts/make-pipeline-import.py), and the render server's plugin reads it through the GPU driver (the pipeline caches compiled
-// ahead on the host). Never written here; it does not depend on the log being open.
-constexpr uint64_t kImportGuardBlocks = 256;
-extern "C" uint64_t native_ufs_import_blocks (void)
-{
-  const uint64_t reserve = reserveBlocks ();
-  if (!gStoreGeometry.valid || !gHost.ready || reserve < kLogReserveBlocks + kExportBlocks + kImportGuardBlocks + 1) return 0;
-  return reserve - kLogReserveBlocks - kExportBlocks - kImportGuardBlocks;
-}
-
-extern "C" int native_ufs_import_read (uint64_t rel, uint32_t blocks, void *dst)
-{
-  const uint64_t region = native_ufs_import_blocks ();
-  if (!region || !dst || !blocks || rel >= region || blocks > region - rel) return 0;
-  const uint64_t first = gStoreGeometry.last + 1 - reserveBlocks ();
-  while (blocks) {
-    uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
-    if (hostRead4k (0, first + rel, chunk, dst) != kIOReturnSuccess) return 0;
-    dst = static_cast<uint8_t *> (dst) + chunk * 4096ULL;
-    rel += chunk;
-    blocks -= chunk;
-  }
-  return 1;
-}
-
 extern "C" int native_ufs_store_write (uint64_t rel, uint32_t blocks, const void *src)
 {
   if (storeMode () != 2 || !gStoreRegionBlocks || !src || !blocks || rel >= gStoreRegionBlocks ||
