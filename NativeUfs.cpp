@@ -344,7 +344,10 @@ static void dpuEnable (uintptr_t smmu, uintptr_t cb, uint32_t bank, uint32_t old
   const uint32_t old[5] = {read32 (cb, 0x20), read32 (cb, 0x24), read32 (cb, 0x10), read32 (cb, 0x30), read32 (cb, 0x38)};
   gDpuLiveCb = cb;
   write32 (cb, 0x20, static_cast<uint32_t> (pa)); write32 (cb, 0x24, static_cast<uint32_t> (pa >> 32));
-  write32 (cb, 0x10, 5);                              // TCR2: 48-bit output
+  // TCR2 (PASIZE bits 2:0, SEP bits 17:15): 48-bit output and SEP 7 (the sign extension comes from the upstream address, as arm-smmu's AArch64 contexts set it). SEP 0 takes
+  // IA[31] as the sign bit, so every address with bit 31 set but zero above it (the display's own framebuffer at 0xb90f7500: i564, and the
+  // first fetch of every earlier try) is out of TTBR0's range and faults at level 0.
+  write32 (cb, 0x10, 5U | (7U << 15));
   write32 (cb, 0x30, 32U | (1U << 23));               // T0SZ 32, non-cacheable walks, 4 KiB granule, no TTBR1
   write32 (cb, 0x38, 0x44);                           // MAIR attribute 0: normal non-cacheable
   __asm__ volatile ("dsb sy" ::: "memory");
