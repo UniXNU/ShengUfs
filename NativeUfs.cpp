@@ -1046,7 +1046,9 @@ static bool hostBringUp (const char **why)
     smmuBypassStream (0x1401, extraMap, extraReport, 0x9c900000ULL, 8ULL << 20);
     // The endpoint only produces 32-bit addresses and the memory here is above 4 GiB: give its context bank a stage 1 table (4 KiB granule,
     // 32-bit input, L1 -> L2 with 2 MiB blocks) that maps kExtraIova upward onto one contiguous buffer. Own bank only: refused when it is the storage's.
-    constexpr uint32_t kExtraIova = 0x10000000U, kExtraBlocks = 24, kBlock = 2U << 20;
+    // Mainline ath12k owns firmware memory, CE, DP refill and monitor rings.
+    // The former 48 MiB window exhausted before HTC startup on WCN7850.
+    constexpr uint32_t kExtraIova = 0x10000000U, kExtraBlocks = 64, kBlock = 2U << 20;
     IOBufferMemoryDescriptor *buffer = IOBufferMemoryDescriptor::inTaskWithOptions (
       kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
       static_cast<IOOptionBits> (kIOMemoryMapperNone) , (kExtraBlocks + 1) * kBlock, kBlock);
