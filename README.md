@@ -26,3 +26,13 @@ tables travel in `kernel.macho.vroot`; only the owner public anchor is linked
 into the kernel. This implementation has not been built or run since the
 request to stop testing. Class size equality alone does not establish virtual
 interface compatibility. The previous iOS 17 qualification does not apply.
+
+## Wi-Fi DMA window
+
+The optional WCN7850 window maps 128 MiB at IOVA 0x10000000 using 64 two-MiB
+blocks in its own SMMU context bank. The Wi-Fi allocator reports current use,
+peak use and failures. sheng device checks reach interface readiness and
+network traffic with zero DMA allocation failures.
+
+The consuming kernel build compiles the driver. The board's
+`scripts/check-wifi-dma.py` checks window capacity and allocation boundaries.
