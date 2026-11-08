@@ -4,34 +4,58 @@
 // One command slot (RootTransportLayout.h): its request list entry, command descriptor and data area.
 struct UfsSlot {
   unsigned index;
-  uint32_t bit;            // doorbell bit of its request list entry
+  uint32_t entry, bit;     // request list entry and its doorbell bit
   uint8_t *utrd, *ucd, *data;
   uint64_t ucdPhys, dataPhys;
 };
-static UfsSlot ufsSlot (unsigned index)
+// The geometry of every slot, set once at bring-up (hostSlotGeometry), and the request list's form: in a cached region (each entry
+// cleaned and invalidated by its own line) or on its own write-combined page (no cache maintenance).
+static UfsSlot gSlotGeom[kSlots];
+static bool gListUncached = false;
+static int8_t gEntrySlot[32] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                 -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+// Doorbell bits of the commands rung and not yet seen complete (read by the completion interrupt), and per slot the completions the
+// interrupt has seen (what a waiting command sleeps on).
+static volatile uint32_t gOutstanding = 0;
+static volatile uint32_t gSlotGen[kSlots] = {};
+
+static void hostSlotGeometry (unsigned index, uint8_t *utrd, uint32_t entry, uint8_t *ucd, uint64_t ucdPhys, uint8_t *data,
+                              uint64_t dataPhys)
 {
-  UfsSlot slot;
-  slot.index = index;
-  slot.bit = 1U << ufsSlotEntry (index);
-  slot.utrd = gHost.virt + ufsSlotUtrdOffset (index);
-  slot.ucd = gHost.virt + ufsSlotUcdOffset (index);
-  slot.data = gHost.virt + ufsSlotDataOffset (index);
-  slot.ucdPhys = gHost.phys + ufsSlotUcdOffset (index);
-  slot.dataPhys = gHost.phys + ufsSlotDataOffset (index);
-  return slot;
+  UfsSlot &slot = gSlotGeom[index];
+  slot.index = index; slot.entry = entry; slot.bit = 1U << entry;
+  slot.utrd = utrd; slot.ucd = ucd; slot.data = data; slot.ucdPhys = ucdPhys; slot.dataPhys = dataPhys;
+  gEntrySlot[entry] = static_cast<int8_t> (index);
 }
 
+// Slots 0..count-1 of region A with the request list at its offset 0 (entry 2s).
+static void hostSlotGeometryRegionA (unsigned count)
+{
+  for (unsigned e = 0; e < 32; ++e) gEntrySlot[e] = -1;
+  gListUncached = false;
+  for (unsigned s = 0; s < count && s < kRegionSlots; ++s)
+    hostSlotGeometry (s, gHost.virt + ufsSlotUtrdOffset (s), ufsSlotEntry (s), gHost.virt + ufsSlotUcdOffset (s),
+                      gHost.phys + ufsSlotUcdOffset (s), gHost.virt + ufsSlotDataOffset (s), gHost.phys + ufsSlotDataOffset (s));
+}
+
+static UfsSlot ufsSlot (unsigned index) { return gSlotGeom[index]; }
+
+// Completion waits (hostWaitCompletion, supplied by the port): between two polls of a command, a port with the controller's interrupt
+// sleeps until the interrupt sees this slot complete (or a short timeout) instead of spinning. `seen` is the slot's completion count
+// read before the doorbell was polled, so a completion between that poll and the sleep is not missed.
 struct HardwareTransferPort {
   const UfsSlot &slot;
   uint64_t deadline;
-  uint32_t doorbell () { return (read32 (gHost.hc, 0x58) & slot.bit) ? 1U : 0U; }
+  uint32_t seen = 0;
+  uint64_t started = mach_absolute_time ();   // when the wait began: the port polls first and sleeps only past its spin budget
+  uint32_t doorbell () { seen = hostCompletionCount (slot.index); return (read32 (gHost.hc, 0x58) & slot.bit) ? 1U : 0U; }
   uint32_t interrupt () { return read32 (gHost.hc, 0x20); }
   uint32_t completedOcs () {
-    cacheInvalidate (slot.utrd, 64);   // the entry's own line (RootTransportLayout.h)
+    if (!gListUncached) cacheInvalidate (reinterpret_cast<const uint8_t *> (reinterpret_cast<uintptr_t> (slot.utrd) & ~uintptr_t (63)), 64);
     return *reinterpret_cast<volatile uint32_t *> (slot.utrd + 8) & 0xff;
   }
   bool expired () { return mach_absolute_time () >= deadline; }
-  void delay () { IODelay (2); }
+  void delay () { hostWaitCompletion (slot.index, seen, started); }
 };
 
 static void putBe32 (uint8_t *at, uint32_t value)
@@ -54,11 +78,20 @@ static uint32_t loadBe32 (const uint8_t *at)
 // each touches only its own entry, descriptor and data area, and rings only its own doorbell bit (writing 0 bits has no effect).
 // hostSubmit's halves: hostIssue rings the doorbell (*deadline: when the command times out); hostAwait polls for its completion.
 // One caller may have commands of several slots outstanding between them.
+// Zero copy (Linux ufshcd and Apple's storage drivers DMA straight into the request's pages): a physical region description table
+// built from the caller's buffer (hostBuildPrds) instead of the slot's data area. Up to kMaxPrds entries of up to 256 KiB each, at most
+// kXferMax per command; the caller's buffer gets the cache maintenance the data area otherwise gets.
+struct UfsPrd { uint64_t addr; uint32_t bytes; };
+static constexpr unsigned kMaxPrds = (kUcdStride - kPrdtOffset) / 16;
+static constexpr uint32_t kXferMax = 1U << 20, kPrdMax = 256U << 10;
+static bool gZeroCopy = true;
+
 static IOReturn hostIssue (const UfsSlot &slot, uint32_t direction, uint32_t dataBytes, uint32_t timeoutUs, uint64_t *deadline,
-                           uint32_t *ocs)
+                           uint32_t *ocs, const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr)
 {
   *ocs = 15;
-  if (!timeoutUs || dataBytes > kDataMax || (dataBytes & 3) ||
+  if (prds > kMaxPrds || (prds && !buffer)) return kIOReturnBadArgument;
+  if (!timeoutUs || dataBytes > (prds ? kXferMax : kDataMax) || (dataBytes & 3) ||
       (dataBytes ? (direction != 1 && direction != 2) : direction != 0)) return kIOReturnBadArgument;
   if (gHost.poisoned) return kIOReturnNotReady;
   if (read32 (gHost.hc, 0x58) & slot.bit) {
@@ -86,34 +119,45 @@ static IOReturn hostIssue (const UfsSlot &slot, uint32_t direction, uint32_t dat
   for (unsigned index = 0; index < 8; index++) {
     words[index] = 0;
   }
-  words[0] = 0x10000000U | (direction << 25);
+  // I (bit 24): the completion sets IS.UTRCS and raises the interrupt (UFSHCI UTRD dword 0; Linux ufshcd UTP_REQ_DESC_INT_CMD).
+  words[0] = 0x10000000U | (direction << 25) | (hostInterruptMode () ? 1U << 24 : 0U);
   words[2] = 0x0fU;
   words[4] = static_cast<uint32_t> (ucdPhys);
   words[5] = static_cast<uint32_t> (ucdPhys >> 32);
   words[6] = (512U >> 2) | ((kRspOffset >> 2) << 16);
-  words[7] = (dataBytes ? 1U : 0U) | ((kPrdtOffset >> 2) << 16);
+  const unsigned entries = dataBytes ? (prds ? prds : 1U) : 0U;
+  words[7] = entries | ((kPrdtOffset >> 2) << 16);
   if (dataBytes) {
-    uint64_t dataPhys = slot.dataPhys;
-    uint32_t *prd = reinterpret_cast<uint32_t *> (slot.ucd + kPrdtOffset);
-    prd[0] = static_cast<uint32_t> (dataPhys);
-    prd[1] = static_cast<uint32_t> (dataPhys >> 32);
-    prd[2] = 0;
-    prd[3] = dataBytes - 1;
+    uint32_t *table = reinterpret_cast<uint32_t *> (slot.ucd + kPrdtOffset);
+    uint64_t sum = 0;
+    for (unsigned i = 0; i < entries; ++i) {
+      const uint64_t address = prds ? prd[i].addr : slot.dataPhys;
+      const uint32_t bytes = prds ? prd[i].bytes : dataBytes;
+      if (!bytes || bytes > kPrdMax || (bytes & 3) || (address & 3)) return kIOReturnBadArgument;
+      table[4 * i] = static_cast<uint32_t> (address);
+      table[4 * i + 1] = static_cast<uint32_t> (address >> 32);
+      table[4 * i + 2] = 0;
+      table[4 * i + 3] = bytes - 1;
+      sum += bytes;
+    }
+    if (sum != dataBytes) return kIOReturnBadArgument;
   }
-  cacheCivac (slot.utrd, 32);
-  cacheCivac (slot.ucd, kPrdtOffset + 16);
-  if (dataBytes) cacheCivac (slot.data, dataBytes);
-  hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence.
+  if (!gListUncached) cacheCivac (slot.utrd, 32);
+  cacheCivac (slot.ucd, kPrdtOffset + 16 * (entries ? entries : 1U));
+  if (dataBytes) cacheCivac (prds ? buffer : slot.data, dataBytes);
+  if (!hostInterruptMode ()) hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence. With interrupts the handler does.
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, deadline);
+  __atomic_or_fetch (&gOutstanding, slot.bit, __ATOMIC_RELEASE);
   hostWrite (0x58, slot.bit);
   return kIOReturnSuccess;
 }
 
-static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t deadline, uint32_t *ocs)
+static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t deadline, uint32_t *ocs, const void *buffer = nullptr)
 {
-  HardwareTransferPort port = { slot, deadline };
+  HardwareTransferPort port = { slot, deadline, 0 };
   UfsTransferPoll state;
   UfsTransferEnd end = pollUfsTransfer (port, state);
+  if (end == UfsTransferEnd::Completed) __atomic_and_fetch (&gOutstanding, ~slot.bit, __ATOMIC_RELEASE);
   gRootDiagnostic.polls = state.polls;
   gRootDiagnostic.dbSeen = state.doorbellSeen;
   gRootDiagnostic.isSeen = state.interruptSeen;
@@ -126,7 +170,7 @@ static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t dea
     return recordTransport (end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
   }
   cacheInvalidate (slot.ucd, kPrdtOffset);
-  if (dataBytes) cacheInvalidate (slot.data, dataBytes);
+  if (dataBytes) cacheInvalidate (buffer ? buffer : slot.data, dataBytes);
   gRootDiagnostic.response = loadBe32 (slot.ucd + kRspOffset);
   return recordTransport (*ocs == 0 ? kIOReturnSuccess : kIOReturnIOError, *ocs);
 }
@@ -205,14 +249,15 @@ static IOReturn hostNop (void)
 // The task tag is the slot's request list entry, unique among the commands in flight. hostScsiIssue builds and rings the command,
 // hostScsiAwait waits for it and checks its response; hostScsiDir runs both.
 static IOReturn hostScsiIssue (const UfsSlot &slot, uint8_t lun, const uint8_t *cdb, unsigned cdbLength, unsigned direction,
-                               uint32_t dataBytes, uint32_t timeoutUs, uint64_t *deadline, uint32_t *scsiStatus)
+                               uint32_t dataBytes, uint32_t timeoutUs, uint64_t *deadline, uint32_t *scsiStatus,
+                               const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr)
 {
   *scsiStatus = 0xffff;
-  if (!cdb || !cdbLength || cdbLength > 16 || dataBytes > kDataMax || direction > 2 ||
+  if (!cdb || !cdbLength || cdbLength > 16 || dataBytes > (prds ? kXferMax : kDataMax) || direction > 2 ||
       (dataBytes & 3) || (dataBytes ? !direction : direction)) return kIOReturnBadArgument;
   if (!hostClearUcd (slot)) return kIOReturnNotReady;
   uint8_t *ucd = slot.ucd;
-  const uint8_t tag = static_cast<uint8_t> (ufsSlotEntry (slot.index));
+  const uint8_t tag = static_cast<uint8_t> (slot.entry);
   ucd[0] = 0x01;                      // COMMAND UPIU
   ucd[1] = direction == 2 ? 0x40 : direction == 1 ? 0x20 : 0x00;   // R: data in, W: data out
   ucd[2] = lun;
@@ -222,16 +267,17 @@ static IOReturn hostScsiIssue (const UfsSlot &slot, uint8_t lun, const uint8_t *
     ucd[16 + index] = cdb[index];
   }
   uint32_t ocs = 0xf;
-  return hostIssue (slot, direction ? direction : 0U, dataBytes, timeoutUs, deadline, &ocs);
+  return hostIssue (slot, direction ? direction : 0U, dataBytes, timeoutUs, deadline, &ocs, prd, prds, buffer);
 }
 
-static IOReturn hostScsiAwait (const UfsSlot &slot, uint8_t lun, uint32_t dataBytes, uint64_t deadline, uint32_t *scsiStatus)
+static IOReturn hostScsiAwait (const UfsSlot &slot, uint8_t lun, uint32_t dataBytes, uint64_t deadline, uint32_t *scsiStatus,
+                               const void *buffer = nullptr)
 {
   *scsiStatus = 0xffff;
   uint32_t ocs = 0xf;
-  IOReturn status = hostAwait (slot, dataBytes, deadline, &ocs);
+  IOReturn status = hostAwait (slot, dataBytes, deadline, &ocs, buffer);
   if (status != kIOReturnSuccess) return status;
-  const uint8_t tag = static_cast<uint8_t> (ufsSlotEntry (slot.index));
+  const uint8_t tag = static_cast<uint8_t> (slot.entry);
   status = hostResponseHeader (slot, 0x21, lun, tag);
   if (status != kIOReturnSuccess) return status;
   const uint8_t *rsp = slot.ucd + kRspOffset;
@@ -255,11 +301,12 @@ static IOReturn hostScsiAwait (const UfsSlot &slot, uint8_t lun, uint32_t dataBy
 }
 
 static IOReturn hostScsiDir (const UfsSlot &slot, uint8_t lun, const uint8_t *cdb, unsigned cdbLength, unsigned direction,
-                             uint32_t dataBytes, uint32_t timeoutUs, uint32_t *scsiStatus)
+                             uint32_t dataBytes, uint32_t timeoutUs, uint32_t *scsiStatus,
+                             const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr)
 {
   uint64_t deadline = 0;
-  IOReturn status = hostScsiIssue (slot, lun, cdb, cdbLength, direction, dataBytes, timeoutUs, &deadline, scsiStatus);
-  return status != kIOReturnSuccess ? status : hostScsiAwait (slot, lun, dataBytes, deadline, scsiStatus);
+  IOReturn status = hostScsiIssue (slot, lun, cdb, cdbLength, direction, dataBytes, timeoutUs, &deadline, scsiStatus, prd, prds, buffer);
+  return status != kIOReturnSuccess ? status : hostScsiAwait (slot, lun, dataBytes, deadline, scsiStatus, prds ? buffer : nullptr);
 }
 
 // The original read-only entry point: data, when present, always flows device -> host.
@@ -309,6 +356,12 @@ static IOLock *gSlotLock = nullptr;
 // Pool statistics (under gSlotLock): slots taken now, the most taken at once, takes that had to wait for a slot.
 static uint32_t gSlotsBusy = 0, gSlotsPeak = 0;
 static uint64_t gSlotWaits = 0;
+// With the pool empty, takers queue in arrival order and a freed slot goes straight to the oldest of them (no thread can be passed over).
+struct UfsSlotWaiter { UfsSlotWaiter *next; int slot; };
+static UfsSlotWaiter *gSlotWaitHead = nullptr, *gSlotWaitTail = nullptr;
+// Hybrid completion waits (as Linux's hybrid block polling): a wait polls for its first gSpinUs microseconds, then sleeps on the
+// completion interrupt. Short commands complete while polling; long ones leave the CPU after the budget.
+static uint32_t gSpinUs = 200;
 // Set once by the panic path (native_ufs_log_panic). The CPUs that still run may hold a slot forever, so with one slot it is tried for
 // 200 ms and then used anyway. Commands only poll (TransferPoll.h), so they also run with interrupts masked.
 static bool gHostPanic = false;
@@ -338,10 +391,18 @@ static UfsSlot hostSlotTake (bool *pooled)
     return ufsSlot (0);
   }
   IOLockLock (gSlotLock);
-  if (!gSlotFree) ++gSlotWaits;
-  while (!gSlotFree) IOLockSleep (gSlotLock, &gSlotFree, THREAD_UNINT);
-  const unsigned index = static_cast<unsigned> (__builtin_ctz (gSlotFree));
-  gSlotFree &= ~(1U << index);
+  unsigned index;
+  if (gSlotFree) {
+    index = static_cast<unsigned> (__builtin_ctz (gSlotFree));
+    gSlotFree &= ~(1U << index);
+  } else {
+    ++gSlotWaits;
+    UfsSlotWaiter waiter = { nullptr, -1 };
+    if (gSlotWaitTail) gSlotWaitTail->next = &waiter; else gSlotWaitHead = &waiter;
+    gSlotWaitTail = &waiter;
+    while (waiter.slot < 0) IOLockSleep (gSlotLock, &waiter, THREAD_UNINT);
+    index = static_cast<unsigned> (waiter.slot);
+  }
   if (++gSlotsBusy > gSlotsPeak) gSlotsPeak = gSlotsBusy;
   IOLockUnlock (gSlotLock);
   *pooled = true;
@@ -353,9 +414,15 @@ static void hostSlotGive (const UfsSlot &slot, bool pooled)
   if (!pooled) return;
   if (gHostPanic) { gSlotFree |= 1U << slot.index; return; }   // no sleeper wakes in a panic
   IOLockLock (gSlotLock);
-  gSlotFree |= 1U << slot.index;
   --gSlotsBusy;
-  IOLockWakeup (gSlotLock, &gSlotFree, true);
+  if (UfsSlotWaiter *waiter = gSlotWaitHead) {
+    gSlotWaitHead = waiter->next;
+    if (!gSlotWaitHead) gSlotWaitTail = nullptr;
+    waiter->slot = static_cast<int> (slot.index);
+    IOLockWakeup (gSlotLock, waiter, true);
+  } else {
+    gSlotFree |= 1U << slot.index;
+  }
   IOLockUnlock (gSlotLock);
 }
 
@@ -369,11 +436,44 @@ static bool hostRetryable (IOReturn status, uint32_t scsi, unsigned attempt)
   return true;
 }
 
-// Read `blocks` (<= kDataMax / 4096) 4096-byte blocks of LUN `lun` starting at `lba` into dst.
+// The PRDT of a buffer for zero copy: its pages' DMA addresses (hostDmaAddress, supplied by the port; 0 = not reachable), adjacent
+// pages merged. 0 when the buffer does not qualify (not page aligned, a partial page, longer than kXferMax, an unreachable page, more
+// than kMaxPrds entries): the caller then uses the slot's data area.
+static unsigned hostBuildPrds (const void *buffer, uint64_t bytes, UfsPrd *prd)
+{
+  if (!gZeroCopy || (reinterpret_cast<uintptr_t> (buffer) & 4095) || !bytes || (bytes & 4095) || bytes > kXferMax) return 0;
+  unsigned count = 0;
+  for (uint64_t at = 0; at < bytes; at += 4096) {
+    const uint64_t address = hostDmaAddress (static_cast<const uint8_t *> (buffer) + at);
+    if (!address || (address & 4095)) return 0;
+    if (count && prd[count - 1].addr + prd[count - 1].bytes == address && prd[count - 1].bytes + 4096 <= kPrdMax) {
+      prd[count - 1].bytes += 4096;
+    } else {
+      if (count == kMaxPrds) return 0;
+      prd[count].addr = address; prd[count].bytes = 4096; ++count;
+    }
+  }
+  return count;
+}
+
+// Read `blocks` 4096-byte blocks of LUN `lun` starting at `lba` into dst: one command of up to kXferMax straight into dst when it
+// qualifies for zero copy, else commands of up to kDataMax through the slot's data area.
 static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
 {
-  if (!gHost.ready || !dst || !blocks || blocks > kDataMax / 4096 || lba > 0xffffffffULL - (blocks - 1)) {
+  if (!gHost.ready || !dst || !blocks || lba > 0xffffffffULL - (blocks - 1)) {
     return kIOReturnBadArgument;
+  }
+  UfsPrd prd[kMaxPrds];
+  const unsigned prds = blocks <= kXferMax / 4096 ? hostBuildPrds (dst, uint64_t (blocks) * 4096, prd) : 0;
+  if (!prds && blocks > kDataMax / 4096) {
+    // Beyond one command: pieces of kXferMax (each tried for zero copy again), or of kDataMax through the data area.
+    const uint32_t step = blocks > kXferMax / 4096 ? kXferMax / 4096 : kDataMax / 4096;
+    for (uint32_t done = 0; done < blocks; done += step) {
+      const uint32_t chunk = blocks - done > step ? step : blocks - done;
+      IOReturn status = hostRead4k (lun, lba + done, chunk, static_cast<uint8_t *> (dst) + uint64_t (done) * 4096);
+      if (status != kIOReturnSuccess) return status;
+    }
+    return kIOReturnSuccess;
   }
   bool pooled;
   const UfsSlot slot = hostSlotTake (&pooled);
@@ -383,10 +483,10 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   uint32_t scsi = 0;
   IOReturn status;
   for (unsigned attempt = 0;; ++attempt) {
-    status = hostScsiDir (slot, lun, cdb, 10, 2, blocks * 4096U, 1000000, &scsi);
+    status = hostScsiDir (slot, lun, cdb, 10, 2, blocks * 4096U, 1000000, &scsi, prds ? prd : nullptr, prds, prds ? dst : nullptr);
     if (!hostRetryable (status, scsi, attempt)) break;
   }
-  if (status == kIOReturnSuccess) {
+  if (status == kIOReturnSuccess && !prds) {
     memcpy (dst, slot.data, blocks * 4096U);
   }
   hostSlotGive (slot, pooled);
@@ -429,19 +529,29 @@ static bool hostStoreOpen (uint64_t first, uint64_t blocks)
 // WRITE(10) of `blocks` 4096-byte blocks from src to lba on LUN 0; the range must lie inside one open window.
 static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
 {
-  if (!gHost.ready || !src || !blocks || blocks > kDataMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
+  if (!gHost.ready || !src || !blocks || blocks > kXferMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
     return kIOReturnBadArgument;
+  }
+  UfsPrd prd[kMaxPrds];
+  const unsigned prds = hostBuildPrds (src, uint64_t (blocks) * 4096, prd);
+  if (!prds && blocks > kDataMax / 4096) {
+    for (uint32_t done = 0; done < blocks; done += kDataMax / 4096) {
+      const uint32_t chunk = blocks - done > kDataMax / 4096 ? kDataMax / 4096 : blocks - done;
+      IOReturn status = hostWrite4k (lun, lba + done, chunk, static_cast<const uint8_t *> (src) + uint64_t (done) * 4096, fua);
+      if (status != kIOReturnSuccess) return status;
+    }
+    return kIOReturnSuccess;
   }
   bool pooled;
   const UfsSlot slot = hostSlotTake (&pooled);
   gRootDiagnostic.lba = lba;
-  memcpy (slot.data, src, blocks * 4096U);
+  if (!prds) memcpy (slot.data, src, blocks * 4096U);
   uint8_t cdb[10] = { 0x2a, uint8_t (fua ? 0x08 : 0), uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
   uint32_t scsi = 0;
   IOReturn status;
   for (unsigned attempt = 0;; ++attempt) {
-    status = hostScsiDir (slot, 0, cdb, 10, 1, blocks * 4096U, 2000000, &scsi);
+    status = hostScsiDir (slot, 0, cdb, 10, 1, blocks * 4096U, 2000000, &scsi, prds ? prd : nullptr, prds, prds ? src : nullptr);
     if (!hostRetryable (status, scsi, attempt)) break;
   }
   hostSlotGive (slot, pooled);

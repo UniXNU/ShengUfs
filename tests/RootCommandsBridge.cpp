@@ -45,6 +45,11 @@ static void IOLockWakeup(void *, void *, bool) {}
 static IOReturn recordTransport(IOReturn result,uint32_t ocs) {
   gRootDiagnostic.result=result; gRootDiagnostic.ocs=ocs; return result;
 }
+// Polling port: no completion interrupt.
+static uint32_t hostCompletionCount(unsigned) { return 0; }
+static bool hostInterruptMode() { return false; }
+static void hostWaitCompletion(unsigned, uint32_t, uint64_t) { IODelay(2); }
+static uint64_t hostDmaAddress(const void *) { return 0; }   // no zero copy in the host model
 #include "../RootCommands.h"
 #include "../RootQueue.h"
 extern "C" {
@@ -52,9 +57,9 @@ void ufs_test_reset(Callback cb, uint64_t physical) {
   callback=cb; memset(memory,0,sizeof(memory));
   gHost={memory,physical,true,false,0,nullptr}; gRootDiagnostic=UfsRootDiagnostics{};
   gStoreOpen=gLogOpen=false; gStoreFirst=gStoreBlocks=gLogFirst=gLogBlocks=0;
-  hostSlotsInit(kSlots,nullptr); gHostPanic=false;
+  hostSlotGeometryRegionA(kRegionSlots); hostSlotsInit(kRegionSlots,nullptr); gHostPanic=false; gOutstanding=0;
 }
-void ufs_test_slots(unsigned count) { hostSlotsInit(count,nullptr); }
+void ufs_test_slots(unsigned count) { hostSlotGeometryRegionA(count); hostSlotsInit(count,nullptr); }
 unsigned ufs_test_slot_count() { return gSlotCount; }
 int ufs_test_slot_take() { bool pooled; UfsSlot slot=hostSlotTake(&pooled); return pooled ? int(slot.index) : -1-int(slot.index); }
 void ufs_test_slot_give(unsigned index) { hostSlotGive(ufsSlot(index),true); }

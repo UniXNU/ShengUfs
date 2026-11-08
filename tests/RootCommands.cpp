@@ -30,7 +30,7 @@ static uint64_t io(unsigned op,uint64_t address,uint64_t value,void *bytes)
       // Exactly one doorbell bit, of an even request list entry (RootTransportLayout.h).
       assert(value && !(value&(value-1)));
       const unsigned entry=unsigned(__builtin_ctz(uint32_t(value)));
-      assert(entry%2==0 && entry/2<kSlots);
+      assert(entry%2==0 && entry/2<kRegionSlots);
       const unsigned slot=entry/2; lastSlot=slot;
       // The entry points at this slot's command descriptor.
       const uint8_t *utrd=device.data()+ufsSlotUtrdOffset(slot);
@@ -140,27 +140,27 @@ int main()
   reset(); assert(ufs_test_stop_queue() && ufs_test_start_queue());
   assert(registers[0x50/4]==0xcb5e9000 && registers[0x54/4]==8);
   // Command slots: each slot's entry, descriptor, tag and data area; the pool; busy retries; the panic slot; one-slot fallback.
-  for (unsigned slot=0;slot<kSlots;++slot) {
+  for (unsigned slot=0;slot<kRegionSlots;++slot) {
     reset(); uint8_t read10[10]={0x28,0,0,0,0,1,0,0,1,0}; uint32_t status=0xffff;
     assert(ufs_test_scsi_slot(slot,0,read10,10,4096,&status)==0 && status==0 && lastSlot==slot);
     assert(memory[ufsSlotDataOffset(slot)]==uint8_t(0x7b+slot) && memory[ufsSlotDataOffset(slot)+4095]==uint8_t(0x7b+slot));
   }
   reset();
-  assert(ufs_test_slot_count()==kSlots && ufs_test_free_slots()==(1U<<(kSlots-1))-1);   // the last slot is the panic's
+  assert(ufs_test_slot_count()==kRegionSlots && ufs_test_free_slots()==(1U<<(kRegionSlots-1))-1);   // the last slot is the panic's
   assert(ufs_test_slot_take()==0 && ufs_test_slot_take()==1);
   assert(ufs_test_read(0,7,1,out.data())==0 && lastSlot==2 && out[0]==uint8_t(0x7b+2));   // the first free slot
-  assert(ufs_test_free_slots()==(1U<<(kSlots-1))-1-3);                                    // given back after the command
+  assert(ufs_test_free_slots()==(1U<<(kRegionSlots-1))-1-3);                                    // given back after the command
   ufs_test_slot_give(0); ufs_test_slot_give(1);
   assert(ufs_test_store_open(100,64)==1);
   { std::vector<uint8_t> data(8192,0x55); assert(ufs_test_write(0,110,2,data.data())==0 && written==data); }
-  assert(ufs_test_sync()==0 && ufs_test_free_slots()==(1U<<(kSlots-1))-1);
+  assert(ufs_test_sync()==0 && ufs_test_free_slots()==(1U<<(kRegionSlots-1))-1);
   reset(Fault::Busy); busyLeft=3; assert(ufs_test_read(0,1,1,out.data())==0 && !gHost.poisoned);
   reset(Fault::TaskSetFull); busyLeft=5; assert(ufs_test_store_open(100,64)==1);
   { std::vector<uint8_t> data(4096,0x66); assert(ufs_test_write(0,100,1,data.data())==0 && written==data); }
   reset(Fault::Busy); busyLeft=1000; assert(ufs_test_read(0,1,1,out.data())==kIOReturnNotReady && !gHost.poisoned);
-  assert(ufs_test_free_slots()==(1U<<(kSlots-1))-1);                                      // a failed command gives its slot back
-  reset(); ufs_test_panic(); assert(ufs_test_read(0,1,1,out.data())==0 && lastSlot==kSlots-1);
-  assert(ufs_test_free_slots()==(1U<<(kSlots-1))-1);
+  assert(ufs_test_free_slots()==(1U<<(kRegionSlots-1))-1);                                      // a failed command gives its slot back
+  reset(); ufs_test_panic(); assert(ufs_test_read(0,1,1,out.data())==0 && lastSlot==kRegionSlots-1);
+  assert(ufs_test_free_slots()==(1U<<(kRegionSlots-1))-1);
   reset(); ufs_test_slots(1); assert(ufs_test_slot_count()==1 && ufs_test_free_slots()==1);
   assert(ufs_test_read(0,1,1,out.data())==0 && lastSlot==0 && ufs_test_free_slots()==1);
   ufs_test_panic(); assert(ufs_test_read(0,1,1,out.data())==0 && lastSlot==0);

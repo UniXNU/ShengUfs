@@ -46,6 +46,12 @@ static void IOLockWakeup(void *, void *, bool) {}
 static IOReturn recordTransport(IOReturn result,uint32_t ocs) {
   gRootDiagnostic.result=result; gRootDiagnostic.ocs=ocs; return result;
 }
+// Polling port: no completion interrupt.
+static uint32_t hostCompletionCount(unsigned) { return 0; }
+static bool hostInterruptMode() { return false; }
+static void hostWaitCompletion(unsigned, uint32_t, uint64_t) { IODelay(2); }
+// Zero copy: the guest's cached identity map covers 0x40000000..0x48000000.
+static uint64_t hostDmaAddress(const void *va) { const uint64_t a=reinterpret_cast<uintptr_t>(va); return a>=0x40000000ULL && a<0x48000000ULL ? a : 0; }
 #include "../RootCommands.h"
 #include "../RootQueue.h"
 
@@ -81,6 +87,9 @@ extern "C" [[noreturn]] void guest_exception() {
   finish(1);
 }
 alignas(4096) static uint64_t l1[512],l2[512],l3[512];
+// The guest maps one L3 table (2 MiB): it runs the first eight slots, whose layout is the same in every region size.
+constexpr uint32_t kGuestDma=kDmaBytesEightSlots, kGuestSlots=8;
+static_assert(kGuestDma<=512*4096,"guest DMA window exceeds one L3 table");
 alignas(4096) static uint8_t output[kDataMax];
 extern "C" void enable_translation(uint64_t,uint64_t);
 extern "C" void guest_main() {
@@ -95,7 +104,7 @@ extern "C" void guest_main() {
   for (unsigned i=0;i<64;++i) l2[i]=(0x40000000ULL+i*0x200000ULL)|0x401|(share<<8);
   l2[128]=reinterpret_cast<uintptr_t>(l3)|3;
   constexpr uint64_t physical=TEST_DMA_PHYS;
-  for (unsigned i=0;i<kDmaBytes/4096;++i) l3[i]=(physical+i*4096)|0x403|(share<<8);
+  for (unsigned i=0;i<kGuestDma/4096;++i) l3[i]=(physical+i*4096)|0x403|(share<<8);
   enable_translation(reinterpret_cast<uintptr_t>(l1),tcr);
   uint64_t state;
   asm volatile("mrs %0, tcr_el1":"=r"(state)); number("TCR",state);
@@ -111,13 +120,13 @@ extern "C" void guest_main() {
   asm volatile("at s1e1r, %0; isb"::"r"(uint64_t(0x50000000)):"memory");
   asm volatile("mrs %0, par_el1":"=r"(state)); number("DMA_PAR",state);
   check(!(state&1) && (state&0x0000fffffffff000ULL)==physical,"VA to PA");
-  asm volatile("at s1e1r, %0; isb"::"r"(uint64_t(0x50000000+kDmaBytes)):"memory");
+  asm volatile("at s1e1r, %0; isb"::"r"(uint64_t(0x50000000+kGuestDma)):"memory");
   asm volatile("mrs %0, par_el1":"=r"(state)); check(state&1,"4K guard page");
 
   gHost={reinterpret_cast<uint8_t *>(0x50000000),physical,true,false,0x10000000,nullptr};
-  hostSlotsInit(kSlots,nullptr);
-  for (unsigned i=0;i<kDmaBytes;++i) gHost.virt[i]=0;
-  cacheCivac(gHost.virt,kDmaBytes);
+  hostSlotGeometryRegionA(kGuestSlots); hostSlotsInit(kGuestSlots,nullptr);
+  for (unsigned i=0;i<kGuestDma;++i) gHost.virt[i]=0;
+  cacheCivac(gHost.virt,kGuestDma);
   constexpr uintptr_t pci=0x3f008000;
   check(read32(pci,0)==0x00131b36,"QEMU UFS PCI identity");
   write32(pci,0x10,gHost.hc); write32(pci,0x14,0);
@@ -153,6 +162,7 @@ extern "C" void guest_main() {
     check(result==kIOReturnNotReady && (scsi==2 || scsi==0x102),"TUR check condition");
   }
   check(result==0,"TUR ready");
+  gZeroCopy=false;   // these checks cover the data-area path at the configured DMA address
   const unsigned blockCounts[]={1,32};
   for (unsigned blocks: blockCounts) {
     check(hostRead4k(0,8,blocks,output)==0,"READ10");
@@ -163,20 +173,33 @@ extern "C" void guest_main() {
   // Commands of several slots outstanding at once: issue on every slot (each its own LBA), complete them in reverse order, and
   // check that each data area holds its own block (request list entry, descriptor, tag and data per slot).
   {
-    uint64_t deadline[kSlots]; uint32_t status[kSlots];
-    for (unsigned slot=0;slot<kSlots;++slot) {
+    uint64_t deadline[kGuestSlots]; uint32_t status[kGuestSlots];
+    for (unsigned slot=0;slot<kGuestSlots;++slot) {
       const uint8_t lba=uint8_t(8+slot%32);
       uint8_t read10[10]={0x28,0,0,0,0,lba,0,0,1,0};
       check(hostScsiIssue(ufsSlot(slot),0,read10,10,2,4096,1000000,&deadline[slot],&status[slot])==0,"issue on a slot");
     }
-    for (unsigned k=0;k<kSlots;++k) {
-      const unsigned slot=kSlots-1-k;
+    for (unsigned k=0;k<kGuestSlots;++k) {
+      const unsigned slot=kGuestSlots-1-k;
       check(hostScsiAwait(ufsSlot(slot),0,4096,deadline[slot],&status[slot])==0 && status[slot]==0,"slot completes");
       const uint8_t *data=ufsSlot(slot).data; const unsigned base=(slot%32)*4096;
       for (unsigned i=0;i<4096;++i) check(data[i]==uint8_t(((base+i)*17+((base+i)>>8)*31)^0xa5),"slot payload");
     }
   }
   puts("PASS concurrent slots\n");
+  // Zero copy: 512 KiB straight into a page-aligned buffer of the identity map, as two 256 KiB PRDT entries.
+  {
+    gZeroCopy=true;
+    alignas(4096) static uint8_t zc[512*1024];
+    for (unsigned i=0;i<sizeof zc;++i) zc[i]=0xee;
+    cacheCivac(zc,sizeof zc);
+    check(hostRead4k(0,8,128,zc)==0,"zero-copy READ10");
+    check((*reinterpret_cast<volatile uint32_t *>(ufsSlot(0).utrd+28)&0xffff)==2,"zero-copy PRDT entries");
+    for (unsigned i=0;i<131072;++i) check(zc[i]==uint8_t((i*17+(i>>8)*31)^0xa5),"zero-copy payload");
+    for (unsigned i=131072;i<sizeof zc;++i) check(zc[i]==0,"zero-copy tail");
+  }
+  gZeroCopy=false;
+  puts("PASS zero-copy 512K\n");
   for (unsigned i=0;i<4096;++i) output[i]=0xa5;
   check(hostRead4k(0,0x10000,1,output)!=0,"bad LBA accepted");
   for (unsigned i=0;i<4096;++i) check(output[i]==0xa5,"bad LBA copied stale data");

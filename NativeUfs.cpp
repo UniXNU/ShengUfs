@@ -25,6 +25,8 @@ extern const uint8_t verified_root_key[];
 #include <libkern/c++/OSIterator.h>
 #include <IOKit/IOBSD.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>
+#include <machine/machine_routines.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -987,7 +989,152 @@ static void hostWrite (unsigned offset, uint32_t value)
 
 #include "RootQueue.h"
 
+// Completion interrupt hooks of RootCommands.h; defined after it.
+static uint32_t hostCompletionCount (unsigned slot);
+static bool hostInterruptMode (void);
+static void hostWaitCompletion (unsigned slot, uint32_t seen, uint64_t started);
+static uint64_t hostDmaAddress (const void *va);
 #include "RootCommands.h"
+
+// ---- Completion interrupt ------------------------------------------------------------------------------------------
+// The controller's interrupt (GIC SPI 265, level) with only UTRCS enabled (IE bit 0), as in UFSHCI's legacy doorbell mode under Linux
+// ufshcd. The handler clears UTRCS, then, like ufshcd's completion of the requests whose doorbell bits cleared, finds the outstanding
+// commands whose bits are clear and wakes only their waiters; a waiter rechecks its own doorbell bit and OCS. A wait polls for its
+// spin budget (gSpinUs) first and then sleeps until its slot's completion. Bring-up and the panic path always poll; without the
+// interrupt (attach refused) the host polls as before.
+extern "C" IOReturn armcpu_spi_attach (uint32_t, bool, void (*) (void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
+extern "C" IOReturn armcpu_spi_mask (uint32_t, bool) __attribute__((weak_import));
+constexpr uint32_t kUfsIrq = 265 + 32;
+static volatile uint32_t gIrqCount = 0;
+static bool gIrqMode = false;
+extern "C" volatile uint64_t native_ufs_irq_sleeps = 0, native_ufs_irqs = 0;
+extern "C" volatile uint32_t native_ufs_irq_mode = 0;
+
+static uint32_t hostCompletionCount (unsigned slot) { return __atomic_load_n (&gSlotGen[slot], __ATOMIC_ACQUIRE); }
+static bool hostInterruptMode (void) { return gIrqMode && !gHostPanic; }
+static uint64_t gSpinTicks = 0;
+static uint32_t gSpinTicksUs = ~0U;
+static void hostWaitCompletion (unsigned slot, uint32_t seen, uint64_t started)
+{
+  const uint32_t spinUs = *static_cast<volatile uint32_t *> (&gSpinUs);
+  if (spinUs != gSpinTicksUs) { nanoseconds_to_absolutetime (uint64_t (spinUs) * 1000, &gSpinTicks); gSpinTicksUs = spinUs; }
+  if (!hostInterruptMode () || mach_absolute_time () - started < gSpinTicks || !ml_get_interrupts_enabled ()) {
+    IODelay (2);
+    return;
+  }
+  assert_wait_timeout ((event_t) (uintptr_t) &gSlotGen[slot], THREAD_UNINT, 1000, NSEC_PER_USEC);
+  if (hostCompletionCount (slot) != seen) {
+    clear_wait (current_thread (), THREAD_AWAKENED);
+    return;
+  }
+  __atomic_fetch_add (&native_ufs_irq_sleeps, 1, __ATOMIC_RELAXED);
+  thread_block (THREAD_CONTINUE_NULL);
+}
+
+static void hostInterrupt (void *)
+{
+  if (read32 (gHost.hc, 0x20) & 1) {
+    write32 (gHost.hc, 0x20, 1);
+    __asm__ volatile ("dsb sy" ::: "memory");
+  }
+  __atomic_add_fetch (&gIrqCount, 1, __ATOMIC_RELEASE);
+  __atomic_fetch_add (&native_ufs_irqs, 1, __ATOMIC_RELAXED);
+  uint32_t done = __atomic_load_n (&gOutstanding, __ATOMIC_ACQUIRE) & ~read32 (gHost.hc, 0x58);
+  while (done) {
+    const unsigned entry = static_cast<unsigned> (__builtin_ctz (done));
+    done &= done - 1;
+    const int slot = gEntrySlot[entry];
+    if (slot < 0) continue;
+    __atomic_add_fetch (&gSlotGen[slot], 1, __ATOMIC_RELEASE);
+    thread_wakeup ((event_t) (uintptr_t) &gSlotGen[slot]);
+  }
+}
+
+// Zero copy (RootCommands.h): a kernel page's physical address, if the storage stream can reach it (gDmaLimit, from the SMMU's
+// bypass width and the controller's 64-bit addressing, set at bring-up; 0 until then, so no zero copy).
+static uint64_t gDmaLimit = 0;
+static uint64_t hostDmaAddress (const void *va)
+{
+  const uint64_t address = ml_vtophys (reinterpret_cast<vm_offset_t> (va));
+  return address && address < gDmaLimit && gDmaLimit - address >= 4096 ? address : 0;
+}
+extern "C" void native_ufs_set_zero_copy (int on) { gZeroCopy = on != 0; }
+extern "C" void native_ufs_set_spin (uint32_t us) { gSpinUs = us; }
+
+static void hostEnableInterrupt (void)
+{
+  if (gIrqMode || !&armcpu_spi_attach || !&armcpu_spi_mask) return;
+  if (armcpu_spi_attach (kUfsIrq, false, hostInterrupt, nullptr, nullptr, nullptr) != kIOReturnSuccess) return;
+  hostWrite (0x24, 1);                      // UTRCE only
+  if (armcpu_spi_mask (kUfsIrq, false) != kIOReturnSuccess) { hostWrite (0x24, 0); return; }
+  gIrqMode = true;
+  native_ufs_irq_mode = 1;
+}
+
+// The request list on a write-combined page of its own (RootTransportLayout.h): every entry serves a slot, and region A's slots use
+// entries 0..n-1. With 32 entries and region A's 16 slots, region B adds slots 16..31. Any refusal (allocation, address beyond the
+// stream's bypass width or 32 bits without 64-bit addressing, mapping) keeps region A's list and entries 0, 2, ...
+static OSSharedPtr<IOMemoryMap> gListMap;
+static IOBufferMemoryDescriptor *gListDma, *gRegionB;
+extern "C" volatile uint32_t native_ufs_list_mode = 0;   // 0 list in region A (entry 2s), 1 own write-combined page, 2 also region B
+static bool hostReachable (uint64_t phys, uint64_t bytes, bool wide)
+{
+  if (!wide && phys + bytes > 0x100000000ULL) return false;
+  if (!gHost.smmu) return false;
+  const uint32_t idr2 = read32 (gHost.smmu, 0x28);
+  for (unsigned shift = 0; shift <= 8; shift += 4) {
+    const unsigned bits = ufsSmmuAddressBits ((idr2 >> shift) & 15);
+    if (!bits || phys >= (1ULL << bits) || bytes > (1ULL << bits) - phys) return false;
+  }
+  return true;
+}
+static IOBufferMemoryDescriptor *hostContiguous (uint32_t bytes, IOOptionBits cache, bool wide, uint8_t **virt, uint64_t *phys)
+{
+  IOBufferMemoryDescriptor *dma = IOBufferMemoryDescriptor::inTaskWithOptions (
+    kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
+    static_cast<IOOptionBits> (kIOMemoryMapperNone) | cache, bytes, 4096);
+  if (!dma) return nullptr;
+  IOByteCount contiguous = 0;
+  *virt = static_cast<uint8_t *> (dma->getBytesNoCopy ());
+  *phys = dma->getPhysicalSegment (0, &contiguous, kIOMemoryMapperNone);
+  if (!*virt || !*phys || (*phys & 4095) || contiguous < bytes || !hostReachable (*phys, bytes, wide)) {
+    dma->release ();
+    return nullptr;
+  }
+  bzero (*virt, bytes);
+  cacheCivac (*virt, bytes);
+  return dma;
+}
+static void hostSlotsUpgrade (unsigned regionSlots, unsigned entries, bool wide)
+{
+  if (gListDma || regionSlots < 2 || entries < regionSlots) return;
+  uint8_t *cached = nullptr; uint64_t listPhys = 0;
+  IOBufferMemoryDescriptor *list = hostContiguous (4096, kIOMapWriteCombineCache, wide, &cached, &listPhys);
+  if (!list) return;
+  OSSharedPtr<IOMemoryMap> map (list->createMappingInTask (kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache), OSNoRetain);
+  uint8_t *listVirt = map ? reinterpret_cast<uint8_t *> (map->getVirtualAddress ()) : nullptr;
+  if (!listVirt) { list->release (); return; }
+  for (unsigned i = 0; i < 4096; ++i) listVirt[i] = 0;
+  __asm__ volatile ("dsb sy" ::: "memory");
+  gListDma = list; gListMap = map; gUtrlPhys = listPhys;
+  for (unsigned e = 0; e < 32; ++e) gEntrySlot[e] = -1;
+  for (unsigned s = 0; s < regionSlots; ++s)
+    hostSlotGeometry (s, listVirt + 32 * s, s, gHost.virt + ufsSlotUcdOffset (s), gHost.phys + ufsSlotUcdOffset (s),
+                      gHost.virt + ufsSlotDataOffset (s), gHost.phys + ufsSlotDataOffset (s));
+  gListUncached = true;
+  unsigned total = regionSlots;
+  native_ufs_list_mode = 1;
+  uint8_t *b = nullptr; uint64_t bPhys = 0;
+  if (regionSlots == kRegionSlots && entries >= kSlots && (gRegionB = hostContiguous (kRegionBBytes, 0, wide, &b, &bPhys))) {
+    for (unsigned k = 0; k < kRegionSlots; ++k)
+      hostSlotGeometry (kRegionSlots + k, listVirt + 32 * (kRegionSlots + k), kRegionSlots + k, b + k * kUcdStride,
+                        bPhys + k * kUcdStride, b + kRegionBDataOffset + k * kDataMax, bPhys + kRegionBDataOffset + k * kDataMax);
+    total = kSlots;
+    native_ufs_list_mode = 2;
+  }
+  hostSlotsInit (total, gHost.lock);
+  native_ufs_slots = gSlotCount;
+}
 
 // Bring the live controller up for reading: map, SMMU pass-through for the UFS stream, take over
 // the request list, wake the device from UFS-PowerDown and wait for LUN 0 to be ready.
@@ -1018,12 +1165,14 @@ static bool hostBringUp (const char **why)
   // request list must also have entries for them (CAP.NUTRS, entries 0, 2, ...).
   const bool wide = read32 (gHost.hc, 0) & 0x01000000;
   const unsigned entries = (read32 (gHost.hc, 0) & 0x1f) + 1;
-  unsigned slots = (entries + 1) / 2 < kSlots ? (entries + 1) / 2 : kSlots;
+  unsigned slots = (entries + 1) / 2 < kRegionSlots ? (entries + 1) / 2 : kRegionSlots;
   gHost.lock = IOLockAlloc ();
-  const uint32_t sizes[2] = { slots > 1 ? uint32_t (kDmaBytes) : uint32_t (kDmaBytesOneSlot), uint32_t (kDmaBytesOneSlot) };
-  for (unsigned attempt = 0; attempt < 2 && !gHost.virt; ++attempt) {
+  // Smaller regions keep the same layout for their first slots: 16, then 8, then 1.
+  const uint32_t sizes[3] = { uint32_t (kDmaBytes), uint32_t (kDmaBytesEightSlots), uint32_t (kDmaBytesOneSlot) };
+  const unsigned counts[3] = { kRegionSlots, 8, 1 };
+  for (unsigned attempt = 0; attempt < 3 && !gHost.virt; ++attempt) {
     const uint32_t bytes = sizes[attempt];
-    if (attempt == 1 && sizes[0] == kDmaBytesOneSlot) break;
+    if (counts[attempt] > slots && counts[attempt] > 1) continue;
     IOBufferMemoryDescriptor *dma = IOBufferMemoryDescriptor::inTaskWithOptions (
       kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
       static_cast<IOOptionBits> (kIOMemoryMapperNone),
@@ -1044,7 +1193,9 @@ static bool hostBringUp (const char **why)
     *why = !gHost.lock ? "dma buffer" : "DMA address/contiguity";
     return false;
   }
-  hostSlotsInit (gHost.dmaBytes == kDmaBytes ? slots : 1, gHost.lock);
+  const unsigned regionSlots = gHost.dmaBytes == kDmaBytes ? slots : gHost.dmaBytes == kDmaBytesEightSlots ? (slots < 8 ? slots : 8) : 1;
+  hostSlotGeometryRegionA (regionSlots);
+  hostSlotsInit (regionSlots, gHost.lock);
   native_ufs_slots = gSlotCount;
   bzero (gHost.virt, gHost.dmaBytes);
   cacheCivac (gHost.virt, gHost.dmaBytes);
@@ -1187,6 +1338,17 @@ static bool hostBringUp (const char **why)
     gRootDiagnostic.smmuId2 = read32 (gHost.smmu, 0x28);
     gRootDiagnostic.cba2r = read32 (gHost.smmu, 0x1800 + 4 * (report[0] >> 16));
   }
+  {
+    uint64_t limit = wide ? ~0ULL : 0x100000000ULL;
+    const uint32_t idr2 = gHost.smmu ? read32 (gHost.smmu, 0x28) : 0;
+    for (unsigned shift = 0; shift <= 8; shift += 4) {
+      const unsigned bits = ufsSmmuAddressBits ((idr2 >> shift) & 15);
+      const uint64_t width = bits ? (bits >= 64 ? ~0ULL : 1ULL << bits) : 0;
+      if (width < limit) limit = width;
+    }
+    gDmaLimit = limit;
+  }
+  hostSlotsUpgrade (regionSlots, entries, wide);
   if (!hostStartQueue (why)) return false;
   gRootDiagnostic.stage = "NOP OUT";
   // NOP OUT proves the transport before touching the SCSI layer.
@@ -1221,6 +1383,7 @@ static bool hostBringUp (const char **why)
     uint32_t scsi = 0;
     if (hostScsi (0, tur, 6, false, 0, 200000, &scsi) == kIOReturnSuccess) {
       gHost.ready = true;
+      hostEnableInterrupt ();
       return true;
     }
     if (gHost.poisoned) break;
@@ -1342,7 +1505,7 @@ extern "C" int native_ufs_store_read (uint64_t rel, uint32_t blocks, void *dst)
   const uint64_t t0 = mach_absolute_time ();
   int ok = 1;
   while (blocks) {
-    uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
+    uint32_t chunk = blocks > kXferMax / 4096 ? static_cast<uint32_t> (kXferMax / 4096) : blocks;
     if (hostRead4k (0, gStoreRegionFirst + rel, chunk, dst) != kIOReturnSuccess) { ok = 0; break; }
     dst = static_cast<uint8_t *> (dst) + chunk * 4096ULL;
     rel += chunk;
@@ -1359,7 +1522,7 @@ static int storeWrite (uint64_t rel, uint32_t blocks, const void *src, bool fua)
   const uint64_t t0 = mach_absolute_time ();
   int ok = 1;
   while (blocks) {
-    uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
+    uint32_t chunk = blocks > kXferMax / 4096 ? static_cast<uint32_t> (kXferMax / 4096) : blocks;
     if (hostWrite4k (0, gStoreRegionFirst + rel, chunk, src, fua) != kIOReturnSuccess) { ok = 0; break; }
     src = static_cast<const uint8_t *> (src) + chunk * 4096ULL;
     rel += chunk;
@@ -1478,7 +1641,7 @@ extern "C" int native_ufs_part_read (uint32_t lun, uint64_t lba, uint32_t blocks
 {
   if (!gHost.ready || !dst || !blocks || lun > 5) return 0;
   while (blocks) {
-    uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
+    uint32_t chunk = blocks > kXferMax / 4096 ? static_cast<uint32_t> (kXferMax / 4096) : blocks;
     if (hostRead4k (static_cast<uint8_t> (lun), lba, chunk, dst) != kIOReturnSuccess) return 0;
     dst = static_cast<uint8_t *> (dst) + chunk * 4096ULL;
     lba += chunk;
@@ -1569,6 +1732,33 @@ extern "C" int native_ufs_export_write (uint64_t rel, uint32_t blocks, const voi
     blocks -= chunk;
   }
   return 1;
+}
+
+// ---- UniPro attributes (read only) --------------------------------------------------------------------------------
+// DME_GET through the UIC command registers (UFSHCI 5.6): wait for HCS.UCRDY, write UCMDARG1..3 and UICCMD, poll IS.UCCS, read the
+// result code (UCMDARG2[7:0]) and the value (UCMDARG3). Interrupts stay masked, so completion is polled. Under the slot pool lock: one
+// UIC command at a time. Returns 1 with *value, 0 on refusal, timeout or a nonzero result code (*value then holds 0xffff0000 | code).
+extern "C" int native_ufs_dme_get (uint32_t attribute, uint32_t selector, uint32_t *value)
+{
+  if (!gHost.ready || !value || gHostPanic) return 0;
+  IOLockLock (gHost.lock);
+  int ok = 0;
+  *value = 0xffffffffU;
+  if (hostWaitRegister (0x30, 1U << 3, 1U << 3)) {
+    hostWrite (0x20, 1U << 10);                       // clear a stale UIC completion
+    hostWrite (0x94, (attribute << 16) | (selector & 0xffff));
+    hostWrite (0x98, 0);
+    hostWrite (0x9c, 0);
+    hostWrite (0x90, 0x01);                           // DME_GET
+    if (hostWaitRegister (0x20, 1U << 10, 1U << 10)) {
+      const uint32_t code = read32 (gHost.hc, 0x98) & 0xff;
+      if (!code) { *value = read32 (gHost.hc, 0x9c); ok = 1; }
+      else *value = 0xffff0000U | code;
+      hostWrite (0x20, 1U << 10);
+    }
+  }
+  IOLockUnlock (gHost.lock);
+  return ok;
 }
 
 // Command slots: in use, the most taken at once, takes that waited for a free slot (RootCommands.h), for the log.
