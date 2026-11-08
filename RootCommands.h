@@ -306,6 +306,9 @@ static IOReturn hostQueryRead (uint8_t opcode, uint8_t idn, uint32_t *value)
 static unsigned gSlotCount = 1;
 static uint32_t gSlotFree = 1;
 static IOLock *gSlotLock = nullptr;
+// Pool statistics (under gSlotLock): slots taken now, the most taken at once, takes that had to wait for a slot.
+static uint32_t gSlotsBusy = 0, gSlotsPeak = 0;
+static uint64_t gSlotWaits = 0;
 // Set once by the panic path (native_ufs_log_panic). The CPUs that still run may hold a slot forever, so with one slot it is tried for
 // 200 ms and then used anyway. Commands only poll (TransferPoll.h), so they also run with interrupts masked.
 static bool gHostPanic = false;
@@ -335,9 +338,11 @@ static UfsSlot hostSlotTake (bool *pooled)
     return ufsSlot (0);
   }
   IOLockLock (gSlotLock);
+  if (!gSlotFree) ++gSlotWaits;
   while (!gSlotFree) IOLockSleep (gSlotLock, &gSlotFree, THREAD_UNINT);
   const unsigned index = static_cast<unsigned> (__builtin_ctz (gSlotFree));
   gSlotFree &= ~(1U << index);
+  if (++gSlotsBusy > gSlotsPeak) gSlotsPeak = gSlotsBusy;
   IOLockUnlock (gSlotLock);
   *pooled = true;
   return ufsSlot (index);
@@ -349,6 +354,7 @@ static void hostSlotGive (const UfsSlot &slot, bool pooled)
   if (gHostPanic) { gSlotFree |= 1U << slot.index; return; }   // no sleeper wakes in a panic
   IOLockLock (gSlotLock);
   gSlotFree |= 1U << slot.index;
+  --gSlotsBusy;
   IOLockWakeup (gSlotLock, &gSlotFree, true);
   IOLockUnlock (gSlotLock);
 }

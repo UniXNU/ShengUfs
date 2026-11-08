@@ -1571,6 +1571,12 @@ extern "C" int native_ufs_export_write (uint64_t rel, uint32_t blocks, const voi
   return 1;
 }
 
+// Command slots: in use, the most taken at once, takes that waited for a free slot (RootCommands.h), for the log.
+extern "C" void native_ufs_slot_stats (uint32_t *slots, uint32_t *peak, uint64_t *waits)
+{
+  *slots = gSlotCount; *peak = gSlotsPeak; *waits = gSlotWaits;
+}
+
 extern "C" int native_ufs_log_sync (void)
 {
   return gLogRegionBlocks && hostSyncCache () == kIOReturnSuccess;
