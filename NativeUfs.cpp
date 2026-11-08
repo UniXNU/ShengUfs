@@ -903,8 +903,8 @@ void NativeUfs::inspectContextBanks (void)
 // ======================================================================================
 // Root media: the live controller as a read-only block device.
 //
-// One shared host (a single UTP request slot, polled; interrupts stay masked) serves every
-// block device. The DMA region is ordinary cached, physically contiguous kernel memory with
+// One shared host serves every block device: up to kSlots commands in flight, each in its own request slot
+// (RootTransportLayout.h), polled; interrupts stay masked. The DMA region is ordinary cached, physically contiguous kernel memory with
 // explicit cache maintenance around each command (the stream is mapped through the reserved
 // apps_smmu bypass context bank by smmuBypassStream, so physical addresses are used as-is).
 // Nothing here writes to the storage: only INQUIRY-class and READ(10) commands are built, plus
@@ -919,12 +919,15 @@ struct UfsHost {
   IOBufferMemoryDescriptor *dma;
   uint8_t *virt;
   uint64_t phys;
-  IOLock *lock;
+  uint32_t dmaBytes;
+  IOLock *lock;   // the command slot pool's (RootCommands.h)
   bool ready;
   bool poisoned = false;
   uintptr_t smmu = 0, cb = 0;
 };
-UfsHost gHost = { OSSharedPtr<IOMemoryMap> (), OSSharedPtr<IOMemoryMap> (), 0, nullptr, nullptr, 0, nullptr, false };
+UfsHost gHost = { OSSharedPtr<IOMemoryMap> (), OSSharedPtr<IOMemoryMap> (), 0, nullptr, nullptr, 0, 0, nullptr, false };
+// Command slots in use (1 to kSlots), for the log.
+extern "C" volatile uint32_t native_ufs_slots = 0;
 
 static IOReturn recordTransport (IOReturn result, uint32_t ocs)
 {
@@ -1011,31 +1014,44 @@ static bool hostBringUp (const char **why)
     gRootDiagnostic.hce = read32 (gHost.hc, 0x34);
   }
   gRootDiagnostic.stage = "DMA allocation";
-  gHost.dma = IOBufferMemoryDescriptor::inTaskWithOptions (
-    kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
-    static_cast<IOOptionBits> (kIOMemoryMapperNone),
-    kDmaBytes, 4096);
+  // All kSlots command slots when the region is physically contiguous and addressable, else slot 0's original layout alone. The
+  // request list must also have entries for them (CAP.NUTRS, entries 0, 2, ...).
+  const bool wide = read32 (gHost.hc, 0) & 0x01000000;
+  const unsigned entries = (read32 (gHost.hc, 0) & 0x1f) + 1;
+  unsigned slots = (entries + 1) / 2 < kSlots ? (entries + 1) / 2 : kSlots;
   gHost.lock = IOLockAlloc ();
-  if (!gHost.dma || !gHost.lock) {
-    *why = "dma buffer";
+  const uint32_t sizes[2] = { slots > 1 ? uint32_t (kDmaBytes) : uint32_t (kDmaBytesOneSlot), uint32_t (kDmaBytesOneSlot) };
+  for (unsigned attempt = 0; attempt < 2 && !gHost.virt; ++attempt) {
+    const uint32_t bytes = sizes[attempt];
+    if (attempt == 1 && sizes[0] == kDmaBytesOneSlot) break;
+    IOBufferMemoryDescriptor *dma = IOBufferMemoryDescriptor::inTaskWithOptions (
+      kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
+      static_cast<IOOptionBits> (kIOMemoryMapperNone),
+      bytes, 4096);
+    if (!dma) continue;
+    uint8_t *virt = static_cast<uint8_t *> (dma->getBytesNoCopy ());
+    IOByteCount contiguous = 0;
+    uint64_t phys = dma->getPhysicalSegment (0, &contiguous, kIOMemoryMapperNone);
+    gRootDiagnostic.dma = phys;
+    gRootDiagnostic.contiguous = contiguous;
+    if (!virt || !phys || (phys & 4095) || contiguous < bytes || (!wide && phys + bytes > 0x100000000ULL)) {
+      dma->release ();
+      continue;
+    }
+    gHost.dma = dma; gHost.virt = virt; gHost.phys = phys; gHost.dmaBytes = bytes;
+  }
+  if (!gHost.virt || !gHost.lock) {
+    *why = !gHost.lock ? "dma buffer" : "DMA address/contiguity";
     return false;
   }
-  gHost.virt = static_cast<uint8_t *> (gHost.dma->getBytesNoCopy ());
-  IOByteCount contiguous = 0;
-  gHost.phys = gHost.dma->getPhysicalSegment (0, &contiguous, kIOMemoryMapperNone);
-  gRootDiagnostic.dma = gHost.phys;
-  gRootDiagnostic.contiguous = contiguous;
-  if (!gHost.virt || !gHost.phys || (gHost.phys & 4095) || contiguous < kDmaBytes ||
-      (!(read32 (gHost.hc, 0) & 0x01000000) && gHost.phys + kDmaBytes > 0x100000000ULL)) {
-    *why = "DMA address/contiguity";
-    return false;
-  }
-  bzero (gHost.virt, kDmaBytes);
-  cacheCivac (gHost.virt, kDmaBytes);
+  hostSlotsInit (gHost.dmaBytes == kDmaBytes ? slots : 1, gHost.lock);
+  native_ufs_slots = gSlotCount;
+  bzero (gHost.virt, gHost.dmaBytes);
+  cacheCivac (gHost.virt, gHost.dmaBytes);
   uint32_t report[3] = { 0, 0, 0 };
   gRootDiagnostic.stage = "SMMU and request list";
   if (!hostStopQueue (why)) return false;
-  smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, kDmaBytes);
+  smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, gHost.dmaBytes);
   gHost.smmu = gHost.smmuMap->getVirtualAddress ();
   // The board's WiFi endpoint (sheng-wifi=2 or more) needs a pass-through stream of its own, set up here with the same code and at the same moment as the
   // storage stream: the registers of the stream matching group are not safe to touch from another thread later (a read of the first one never returned).
@@ -1590,9 +1606,29 @@ class NativeUfsBlock : public IOBlockStorageDevice {
   uint64_t absolute = 0;      // byte offset of the window on LUN 0
   uint64_t bytes = 0;
   char label[32] = {};
-  uint8_t *bounce = nullptr;
-  IOLock *windowLock = nullptr;
+  // Requests run concurrently, each with its own bounce buffer from the pool: a request verifies and copies the snapshot in its
+  // own buffer, so no lock is held across the read, the integrity check or the copy (RootWindowRead.h).
+  static constexpr unsigned kBounces = 4;
+  uint8_t *bounces[kBounces] = {};
+  uint32_t bounceFree = 0;
+  IOLock *windowLock = nullptr;   // guards bounceFree
   bool online = false;
+  uint8_t *takeBounce ()
+  {
+    IOLockLock (windowLock);
+    while (!bounceFree) IOLockSleep (windowLock, &bounceFree, THREAD_UNINT);
+    const unsigned k = static_cast<unsigned> (__builtin_ctz (bounceFree));
+    bounceFree &= ~(1U << k);
+    IOLockUnlock (windowLock);
+    return bounces[k];
+  }
+  void giveBounce (uint8_t *buffer)
+  {
+    IOLockLock (windowLock);
+    for (unsigned k = 0; k < kBounces; ++k) if (bounces[k] == buffer) bounceFree |= 1U << k;
+    IOLockWakeup (windowLock, &bounceFree, true);
+    IOLockUnlock (windowLock);
+  }
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
   struct vr_view verified = {};
   vm_offset_t verifiedStorage = 0;
@@ -1684,9 +1720,13 @@ bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint6
   bytes = size;
   windowLock = IOLockAlloc ();
   if (!windowLock) return false;
-  bounce = static_cast<uint8_t *> (IOMalloc (kDataMax));
-  if (!bounce) {
-    return false;
+  for (unsigned k = 0; k < kBounces; ++k) {
+    bounces[k] = static_cast<uint8_t *> (IOMalloc (kDataMax));
+    if (!bounces[k]) {
+      if (!k) return false;
+      break;
+    }
+    bounceFree |= 1U << k;
   }
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
   // Reads are served only after each 4096-byte integrity block verifies against the owner-signed
@@ -1880,7 +1920,7 @@ extern "C" int native_ufs_block_authenticates (IOService *provider, const char *
 
 bool NativeUfsBlock::start (IOService *provider)
 {
-  if (!bounce || !windowLock || !IOBlockStorageDevice::start (provider)) {
+  if (!bounceFree || !windowLock || !IOBlockStorageDevice::start (provider)) {
     return false;
   }
   online = true;
@@ -1902,13 +1942,12 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     return kIOReturnNotReady;
   }
   struct Operations {
-    IOLock *mutex;
     IOMemoryDescriptor *buffer;
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
     const vr_view *view;
 #endif
-    void lock () { IOLockLock (mutex); }
-    void unlock () { IOLockUnlock (mutex); }
+    void lock () {}     // the request's own bounce buffer holds its snapshot
+    void unlock () {}
     IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
       uint64_t t0 = timerTicks ();
       IOReturn r = hostRead4k (0, lba, blocks, out);
@@ -1942,12 +1981,14 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
       if (copied == length) __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
       return copied;
     }
-  } operations = { windowLock, buffer
+  } operations = { buffer
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
     , &verified
 #endif
   };
+  uint8_t *bounce = takeBounce ();
   UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounce);
+  giveBounce (bounce);
   IOReturn result = outcome.status;
   uint64_t done = outcome.done;
   if (result != kIOReturnSuccess) {
@@ -1967,10 +2008,11 @@ void NativeUfsBlock::free ()
     verifiedStorage = 0;
   }
 #endif
-  if (bounce) {
-    IOFree (bounce, kDataMax);
-    bounce = nullptr;
+  for (unsigned k = 0; k < kBounces; ++k) {
+    if (bounces[k]) IOFree (bounces[k], kDataMax);
+    bounces[k] = nullptr;
   }
+  bounceFree = 0;
   if (windowLock) {
     IOLockFree (windowLock);
     windowLock = nullptr;

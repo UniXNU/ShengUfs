@@ -38,6 +38,11 @@ static void IODelay(uint32_t us) {
 // Single EL1 CPU, interrupts masked. This does not test XNU lock scheduling.
 static void IOLockLock(void *) {}
 static void IOLockUnlock(void *) {}
+static bool IOLockTryLock(void *) { return true; }
+struct IOLock;
+constexpr int THREAD_UNINT=0;
+static int IOLockSleep(void *, void *, int) { return 0; }   // single-threaded guest: the slot pool never runs empty
+static void IOLockWakeup(void *, void *, bool) {}
 static IOReturn recordTransport(IOReturn result,uint32_t ocs) {
   gRootDiagnostic.result=result; gRootDiagnostic.ocs=ocs; return result;
 }
@@ -110,6 +115,7 @@ extern "C" void guest_main() {
   asm volatile("mrs %0, par_el1":"=r"(state)); check(state&1,"4K guard page");
 
   gHost={reinterpret_cast<uint8_t *>(0x50000000),physical,true,false,0x10000000,nullptr};
+  hostSlotsInit(kSlots,nullptr);
   for (unsigned i=0;i<kDmaBytes;++i) gHost.virt[i]=0;
   cacheCivac(gHost.virt,kDmaBytes);
   constexpr uintptr_t pci=0x3f008000;
@@ -154,6 +160,23 @@ extern "C" void guest_main() {
     check(*reinterpret_cast<uint32_t *>(gHost.virt+kUcdOffset+kPrdtOffset+4)==uint32_t((physical+kDataOffset)>>32),"PRDT upper PA");
   }
   puts("PASS READ4K READ128K\n");
+  // Commands of several slots outstanding at once: issue on every slot (each its own LBA), complete them in reverse order, and
+  // check that each data area holds its own block (request list entry, descriptor, tag and data per slot).
+  {
+    uint64_t deadline[kSlots]; uint32_t status[kSlots];
+    for (unsigned slot=0;slot<kSlots;++slot) {
+      const uint8_t lba=uint8_t(8+slot%32);
+      uint8_t read10[10]={0x28,0,0,0,0,lba,0,0,1,0};
+      check(hostScsiIssue(ufsSlot(slot),0,read10,10,2,4096,1000000,&deadline[slot],&status[slot])==0,"issue on a slot");
+    }
+    for (unsigned k=0;k<kSlots;++k) {
+      const unsigned slot=kSlots-1-k;
+      check(hostScsiAwait(ufsSlot(slot),0,4096,deadline[slot],&status[slot])==0 && status[slot]==0,"slot completes");
+      const uint8_t *data=ufsSlot(slot).data; const unsigned base=(slot%32)*4096;
+      for (unsigned i=0;i<4096;++i) check(data[i]==uint8_t(((base+i)*17+((base+i)>>8)*31)^0xa5),"slot payload");
+    }
+  }
+  puts("PASS concurrent slots\n");
   for (unsigned i=0;i<4096;++i) output[i]=0xa5;
   check(hostRead4k(0,0x10000,1,output)!=0,"bad LBA accepted");
   for (unsigned i=0;i<4096;++i) check(output[i]==0xa5,"bad LBA copied stale data");
