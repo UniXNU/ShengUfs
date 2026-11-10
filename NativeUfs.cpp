@@ -2312,10 +2312,19 @@ static void publishThread (void *, wait_result_t)
       for (unsigned tick = 0; tick <= 300; ++tick) {
         ready = mediaWithUuidExists (uuid, device);
         if (ready || tick == 300) break;
+        if (tick && tick % 50 == 0) {
+          // Every 5 s: what the IOKit side has published so far, and whether the window's own matching is still busy.
+          captureMissingMedia (uuid);
+          IOLog ("NativeUfs: %s volume %s still missing after %u s, window busy %u\n%s", device->windowLabel (), uuid,
+                 tick / 10, device->getBusyState (), gRootMediaText);
+        }
         IOSleep (100);
       }
       IOLog ("NativeUfs: %s volume %s %s\n", device->windowLabel (), uuid, ready ? "ready" : "not ready");
-      if (!ready) captureMissingMedia (uuid);
+      if (!ready) {
+        captureMissingMedia (uuid);
+        IOLog ("NativeUfs: media at timeout, window busy %u\n%s", device->getBusyState (), gRootMediaText);
+      }
       return ready;
     }
     void discard (unsigned index) { discardPendingWindow (index); }
