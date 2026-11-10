@@ -1014,14 +1014,29 @@ static uint32_t hostCompletionCount (unsigned slot) { return __atomic_load_n (&g
 static bool hostInterruptMode (void) { return gIrqMode && !gHostPanic; }
 static uint64_t gSpinTicks = 0;
 static uint32_t gSpinTicksUs = ~0U;
+// Completion wait statistics, for the log (native_ufs_stats_text).
+// The pause between two polls is IODelay (2). XNU's delay spins only when the delay is shorter than the idle exit latency the CPU was
+// registered with (ml_delay_should_spin, from ml_processor_info_t.powergate_latency); on a CPU registered without one it blocks the
+// thread on a timer, so a pause then lasts longer than 2 us and its end is charged to the calling task as an interrupt wakeup.
+// gWaitPauses and gWaitPauseTicks record what the pauses cost on the running platform. gIrqWakes, gIrqWakeTicks and gIrqWakeMaxTicks
+// record the sleeps the interrupt ended and the time from the handler first seeing the completion to the waiter running again;
+// gIrqTimeouts the sleeps that ran into their timeout.
+// gSlotDoneAt holds that first sighting: the waiter clears it before it sleeps and the handler fills it only while it is clear, since
+// every later interrupt sees the same command complete again until its waiter has run.
+static volatile uint64_t gWaitPauses = 0, gWaitPauseTicks = 0, gIrqWakes = 0, gIrqWakeTicks = 0, gIrqWakeMaxTicks = 0, gIrqTimeouts = 0;
+static volatile uint64_t gSlotDoneAt[kSlots] = {};
 static void hostWaitCompletion (unsigned slot, uint32_t seen, uint64_t started)
 {
   const uint32_t spinUs = *static_cast<volatile uint32_t *> (&gSpinUs);
   if (spinUs != gSpinTicksUs) { nanoseconds_to_absolutetime (uint64_t (spinUs) * 1000, &gSpinTicks); gSpinTicksUs = spinUs; }
-  if (!hostInterruptMode () || mach_absolute_time () - started < gSpinTicks || !ml_get_interrupts_enabled ()) {
+  const uint64_t now = mach_absolute_time ();
+  if (!hostInterruptMode () || now - started < gSpinTicks || !ml_get_interrupts_enabled ()) {
     IODelay (2);
+    __atomic_fetch_add (&gWaitPauses, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add (&gWaitPauseTicks, mach_absolute_time () - now, __ATOMIC_RELAXED);
     return;
   }
+  __atomic_store_n (&gSlotDoneAt[slot], 0, __ATOMIC_RELAXED);
   assert_wait_timeout ((event_t) (uintptr_t) &gSlotGen[slot], THREAD_UNINT, 1000, NSEC_PER_USEC);
   if (hostCompletionCount (slot) != seen) {
     clear_wait (current_thread (), THREAD_AWAKENED);
@@ -1029,6 +1044,17 @@ static void hostWaitCompletion (unsigned slot, uint32_t seen, uint64_t started)
   }
   __atomic_fetch_add (&native_ufs_irq_sleeps, 1, __ATOMIC_RELAXED);
   thread_block (THREAD_CONTINUE_NULL);
+  if (hostCompletionCount (slot) == seen) {
+    __atomic_fetch_add (&gIrqTimeouts, 1, __ATOMIC_RELAXED);
+    return;
+  }
+  const uint64_t done = __atomic_load_n (&gSlotDoneAt[slot], __ATOMIC_RELAXED), woke = mach_absolute_time ();
+  if (!done) return;
+  const uint64_t late = woke > done ? woke - done : 0;
+  __atomic_fetch_add (&gIrqWakes, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add (&gIrqWakeTicks, late, __ATOMIC_RELAXED);
+  uint64_t longest = __atomic_load_n (&gIrqWakeMaxTicks, __ATOMIC_RELAXED);
+  while (late > longest && !__atomic_compare_exchange_n (&gIrqWakeMaxTicks, &longest, late, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
 }
 
 static void hostInterrupt (void *)
@@ -1040,11 +1066,14 @@ static void hostInterrupt (void *)
   __atomic_add_fetch (&gIrqCount, 1, __ATOMIC_RELEASE);
   __atomic_fetch_add (&native_ufs_irqs, 1, __ATOMIC_RELAXED);
   uint32_t done = __atomic_load_n (&gOutstanding, __ATOMIC_ACQUIRE) & ~read32 (gHost.hc, 0x58);
+  const uint64_t now = done ? mach_absolute_time () : 0;
   while (done) {
     const unsigned entry = static_cast<unsigned> (__builtin_ctz (done));
     done &= done - 1;
     const int slot = gEntrySlot[entry];
     if (slot < 0) continue;
+    uint64_t clear = 0;
+    __atomic_compare_exchange_n (&gSlotDoneAt[slot], &clear, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
     __atomic_add_fetch (&gSlotGen[slot], 1, __ATOMIC_RELEASE);
     thread_wakeup ((event_t) (uintptr_t) &gSlotGen[slot]);
   }
@@ -1490,19 +1519,28 @@ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const
 extern "C" volatile uint64_t native_ufs_store_rd_ops = 0, native_ufs_store_rd_ticks = 0, native_ufs_store_wr_ops = 0,
                              native_ufs_store_wr_ticks = 0, native_ufs_store_sync_ops = 0, native_ufs_store_sync_ticks = 0,
                              native_ufs_store_max_ticks = 0;
-static void storeAccount (volatile uint64_t *ops, volatile uint64_t *ticks, uint64_t t0)
+// What the longest call was, for the log: 'r' read, 'w' write, 's' cache flush, and its blocks. Written without a lock right after the
+// longest time, so under a race the pair may name a call of almost the same length.
+static volatile uint32_t gStoreMaxKind = 0, gStoreMaxBlocks = 0;
+static void storeAccount (volatile uint64_t *ops, volatile uint64_t *ticks, uint64_t t0, char kind, uint32_t blocks)
 {
   const uint64_t spent = mach_absolute_time () - t0;
   __atomic_fetch_add (ops, 1, __ATOMIC_RELAXED);
   __atomic_fetch_add (ticks, spent, __ATOMIC_RELAXED);
   uint64_t seen = native_ufs_store_max_ticks;
-  while (spent > seen && !__atomic_compare_exchange_n (&native_ufs_store_max_ticks, &seen, spent, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+  while (spent > seen) {
+    if (!__atomic_compare_exchange_n (&native_ufs_store_max_ticks, &seen, spent, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) continue;
+    __atomic_store_n (&gStoreMaxKind, static_cast<uint32_t> (kind), __ATOMIC_RELAXED);
+    __atomic_store_n (&gStoreMaxBlocks, blocks, __ATOMIC_RELAXED);
+    break;
+  }
 }
 
 extern "C" int native_ufs_store_read (uint64_t rel, uint32_t blocks, void *dst)
 {
   if (!gStoreRegionBlocks || !dst || !blocks || rel >= gStoreRegionBlocks || blocks > gStoreRegionBlocks - rel) return 0;
   const uint64_t t0 = mach_absolute_time ();
+  const uint32_t asked = blocks;
   int ok = 1;
   while (blocks) {
     uint32_t chunk = blocks > kXferMax / 4096 ? static_cast<uint32_t> (kXferMax / 4096) : blocks;
@@ -1511,7 +1549,7 @@ extern "C" int native_ufs_store_read (uint64_t rel, uint32_t blocks, void *dst)
     rel += chunk;
     blocks -= chunk;
   }
-  storeAccount (&native_ufs_store_rd_ops, &native_ufs_store_rd_ticks, t0);
+  storeAccount (&native_ufs_store_rd_ops, &native_ufs_store_rd_ticks, t0, 'r', asked);
   return ok;
 }
 
@@ -1520,6 +1558,7 @@ static int storeWrite (uint64_t rel, uint32_t blocks, const void *src, bool fua)
   if (storeMode () != 2 || !gStoreRegionBlocks || !src || !blocks || rel >= gStoreRegionBlocks ||
       blocks > gStoreRegionBlocks - rel) return 0;
   const uint64_t t0 = mach_absolute_time ();
+  const uint32_t asked = blocks;
   int ok = 1;
   while (blocks) {
     uint32_t chunk = blocks > kXferMax / 4096 ? static_cast<uint32_t> (kXferMax / 4096) : blocks;
@@ -1528,7 +1567,7 @@ static int storeWrite (uint64_t rel, uint32_t blocks, const void *src, bool fua)
     rel += chunk;
     blocks -= chunk;
   }
-  storeAccount (&native_ufs_store_wr_ops, &native_ufs_store_wr_ticks, t0);
+  storeAccount (&native_ufs_store_wr_ops, &native_ufs_store_wr_ticks, t0, 'w', asked);
   return ok;
 }
 
@@ -1550,7 +1589,7 @@ extern "C" int native_ufs_store_sync (void)
   if (storeMode () != 2 || !gStoreRegionBlocks) return 0;
   const uint64_t t0 = mach_absolute_time ();
   const int ok = hostSyncCache () == kIOReturnSuccess;
-  storeAccount (&native_ufs_store_sync_ops, &native_ufs_store_sync_ticks, t0);
+  storeAccount (&native_ufs_store_sync_ops, &native_ufs_store_sync_ticks, t0, 's', 0);
   return ok;
 }
 
@@ -1794,6 +1833,11 @@ extern "C" unsigned native_ufs_store_gpt_check (void)
   return rootCrc32 (entries, gStoreGeometry.entryCount * 128) == gStoreGeometry.entriesCrc ? 0 : 5;
 }
 
+// Root window requests, for the log (native_ufs_stats_text): their count, bytes and time from entry to the completion call (the wait
+// for a bounce buffer, the reads, the block verification and the copy to the caller), and the requests that had to wait for a bounce
+// buffer with the time they waited.
+static volatile uint64_t gWindowRequests = 0, gWindowBytes = 0, gWindowTicks = 0, gBounceWaits = 0, gBounceWaitTicks = 0;
+
 // One read-only window of the root image as a block device: 512-byte sectors on top of 4096-byte
 // UFS blocks, so the unchanged dmg disk images (GPT with 512-byte sectors) parse as they do on
 // the virtio path.
@@ -1812,7 +1856,12 @@ class NativeUfsBlock : public IOBlockStorageDevice {
   uint8_t *takeBounce ()
   {
     IOLockLock (windowLock);
-    while (!bounceFree) IOLockSleep (windowLock, &bounceFree, THREAD_UNINT);
+    if (!bounceFree) {
+      const uint64_t t0 = mach_absolute_time ();
+      while (!bounceFree) IOLockSleep (windowLock, &bounceFree, THREAD_UNINT);
+      __atomic_fetch_add (&gBounceWaits, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add (&gBounceWaitTicks, mach_absolute_time () - t0, __ATOMIC_RELAXED);
+    }
     const unsigned k = static_cast<unsigned> (__builtin_ctz (bounceFree));
     bounceFree &= ~(1U << k);
     IOLockUnlock (windowLock);
@@ -2182,9 +2231,13 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     , &verified
 #endif
   };
+  const uint64_t entered = mach_absolute_time ();
   uint8_t *bounce = takeBounce ();
   UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounce);
   giveBounce (bounce);
+  __atomic_fetch_add (&gWindowRequests, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add (&gWindowBytes, outcome.done, __ATOMIC_RELAXED);
+  __atomic_fetch_add (&gWindowTicks, mach_absolute_time () - entered, __ATOMIC_RELAXED);
   IOReturn result = outcome.status;
   uint64_t done = outcome.done;
   if (result != kIOReturnSuccess) {
@@ -2194,6 +2247,37 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
   }
   completion->action (completion->target, completion->parameter, result, done);
   return kIOReturnSuccess;
+}
+
+// One row of command and wait statistics for the board's log. It only reads counters, so any context may call it.
+//   direct, staged    data commands straight to or from the caller's pages, and through the slot's data area with a copy
+//   busy              commands the device answered with BUSY or TASK SET FULL and the driver sent again
+//   long k/n          the longest store call (native_ufs_store_max_ticks): r read, w write, s cache flush, and its blocks
+//   pauses n/us       poll pauses of the completion waits and their total time (2 us each where the delay spins)
+//   irqs, sleeps      completion interrupts taken, and waits that slept for one
+//   wakes n/us max    sleeps the interrupt ended, the total and the longest time from the interrupt to the waiter running again
+//   timeouts          sleeps that ended on their 1 ms timeout instead
+//   win n/MiB/ms      root window requests, their bytes and their time (bounce wait, reads, block verification, copy)
+//   wait n/ms         root window requests that waited for a bounce buffer, and the time they waited
+//   vb                integrity blocks verified
+extern "C" void native_ufs_stats_text (char *out, size_t size)
+{
+  if (!out || !size) return;
+  const auto us = [] (uint64_t ticks) { uint64_t ns = 0; absolutetime_to_nanoseconds (ticks, &ns); return static_cast<unsigned long long> (ns / 1000); };
+  const auto count = [] (const volatile uint64_t &value) { return static_cast<unsigned long long> (__atomic_load_n (&value, __ATOMIC_RELAXED)); };
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  const unsigned long long verified = count (native_ufs_verified_blocks);
+#else
+  const unsigned long long verified = 0;
+#endif
+  const uint32_t kind = __atomic_load_n (&gStoreMaxKind, __ATOMIC_RELAXED);
+  snprintf (out, size, "UFS direct=%llu staged=%llu busy=%llu long=%c/%u pauses=%llu/%lluus irqs=%llu sleeps=%llu wakes=%llu/%lluus "
+            "max=%lluus timeouts=%llu win=%llu/%lluM/%llums wait=%llu/%llums vb=%llu",
+            count (gDirectCommands), count (gStagedCommands), count (gBusyRetries), kind ? static_cast<char> (kind) : '-',
+            __atomic_load_n (&gStoreMaxBlocks, __ATOMIC_RELAXED), count (gWaitPauses), us (count (gWaitPauseTicks)),
+            count (native_ufs_irqs), count (native_ufs_irq_sleeps), count (gIrqWakes), us (count (gIrqWakeTicks)),
+            us (count (gIrqWakeMaxTicks)), count (gIrqTimeouts), count (gWindowRequests), count (gWindowBytes) >> 20,
+            us (count (gWindowTicks)) / 1000, count (gBounceWaits), us (count (gBounceWaitTicks)) / 1000, verified);
 }
 
 void NativeUfsBlock::free ()

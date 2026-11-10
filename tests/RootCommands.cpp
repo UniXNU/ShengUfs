@@ -103,6 +103,7 @@ int main()
   std::array<uint8_t,131072> out;
   assert(ufs_test_read(0,1,32,out.data())==0);
   assert(std::all_of(out.begin(),out.end(),[](uint8_t x){return x==0x7b;}));
+  assert(dataAcquired && gStagedCommands==1 && gDirectCommands==0);   // the host model has no zero copy
   assert(*reinterpret_cast<uint32_t *>(device.data()+20)==8);
   assert(*reinterpret_cast<uint32_t *>(device.data()+4096+1024+4)==8);
   assert(ufs_test_read(0,0xffffffffULL,1,out.data())==0); // Last READ(10) LBA is valid.
@@ -158,7 +159,7 @@ int main()
   { std::vector<uint8_t> data(8192,0x55); assert(ufs_test_write(0,110,2,data.data())==0 && written==data); }
   assert(!dataAcquired);
   assert(ufs_test_sync()==0 && ufs_test_free_slots()==(1U<<(kRegionSlots-1))-1);
-  reset(Fault::Busy); busyLeft=3; assert(ufs_test_read(0,1,1,out.data())==0 && !gHost.poisoned);
+  reset(Fault::Busy); busyLeft=3; assert(ufs_test_read(0,1,1,out.data())==0 && !gHost.poisoned && gBusyRetries==3);
   reset(Fault::TaskSetFull); busyLeft=5; assert(ufs_test_store_open(100,64)==1);
   { std::vector<uint8_t> data(4096,0x66); assert(ufs_test_write(0,100,1,data.data())==0 && written==data); }
   reset(Fault::Busy); busyLeft=1000; assert(ufs_test_read(0,1,1,out.data())==kIOReturnNotReady && !gHost.poisoned);

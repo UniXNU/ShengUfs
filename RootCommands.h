@@ -85,6 +85,8 @@ struct UfsPrd { uint64_t addr; uint32_t bytes; };
 static constexpr unsigned kMaxPrds = (kUcdStride - kPrdtOffset) / 16;
 static constexpr uint32_t kXferMax = 1U << 20, kPrdMax = 256U << 10;
 static bool gZeroCopy = true;
+// Data commands by path, for the log: straight to or from the caller's pages, or through the slot's data area with a copy.
+static volatile uint64_t gDirectCommands = 0, gStagedCommands = 0;
 
 static IOReturn hostIssue (const UfsSlot &slot, uint32_t direction, uint32_t dataBytes, uint32_t timeoutUs, uint64_t *deadline,
                            uint32_t *ocs, const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr)
@@ -435,9 +437,11 @@ static void hostSlotGive (const UfsSlot &slot, bool pooled)
 // A command the device refused for now: BUSY (0x08) or TASK SET FULL (0x28), as when more commands are queued than it accepts. It is
 // sent again after a short pause, up to kBusyRetries times; any other status is final.
 static constexpr unsigned kBusyRetries = 50;
+static volatile uint64_t gBusyRetries = 0;   // commands sent again, for the log
 static bool hostRetryable (IOReturn status, uint32_t scsi, unsigned attempt)
 {
   if (status != kIOReturnNotReady || (scsi != 0x08 && scsi != 0x28) || attempt >= kBusyRetries) return false;
+  __atomic_fetch_add (&gBusyRetries, 1, __ATOMIC_RELAXED);
   IODelay (attempt < 4 ? 50U << attempt : 1000U);
   return true;
 }
@@ -484,6 +488,7 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   bool pooled;
   const UfsSlot slot = hostSlotTake (&pooled);
   gRootDiagnostic.lba = lba;
+  __atomic_fetch_add (prds ? &gDirectCommands : &gStagedCommands, 1, __ATOMIC_RELAXED);
   uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
   uint32_t scsi = 0;
@@ -551,6 +556,7 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
   bool pooled;
   const UfsSlot slot = hostSlotTake (&pooled);
   gRootDiagnostic.lba = lba;
+  __atomic_fetch_add (prds ? &gDirectCommands : &gStagedCommands, 1, __ATOMIC_RELAXED);
   if (!prds) memcpy (slot.data, src, blocks * 4096U);
   uint8_t cdb[10] = { 0x2a, uint8_t (fua ? 0x08 : 0), uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };

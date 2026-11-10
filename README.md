@@ -49,6 +49,27 @@ again after a pause. Root window reads each take their own bounce buffer.
 `native_ufs_dme_get` reads UniPro attributes. The sheng link runs HS-G5 Rate A
 on two lanes in FAST mode, as the boot firmware leaves it.
 
+## Statistics
+
+`native_ufs_stats_text` fills one row for the board's log:
+
+| Field | Meaning |
+| --- | --- |
+| `direct`, `staged` | Data commands on the caller's pages, and through the slot's data area |
+| `busy` | Commands answered with BUSY or TASK SET FULL and sent again |
+| `long k/n` | The longest store call: `r` read, `w` write, `s` cache flush, and its blocks |
+| `pauses n/us` | Poll pauses of completion waits and their total time |
+| `irqs`, `sleeps` | Completion interrupts, and waits that slept for one |
+| `wakes n/us`, `max` | Sleeps the interrupt ended, total and longest time until the waiter ran |
+| `timeouts` | Sleeps that ended on their 1 ms timeout |
+| `win n/MiB/ms` | Root window requests, their bytes and their time |
+| `wait n/ms` | Root window requests that waited for a bounce buffer |
+| `vb` | Integrity blocks verified |
+
+A poll pause is `IODelay(2)`. XNU spins for it only on a CPU registered with an
+idle exit latency above the delay; otherwise the thread blocks on a timer, and
+`pauses` shows the cost.
+
 ## Tests
 
 `tests/RootCommands.cpp` runs the production command code against a host model:
