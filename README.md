@@ -46,6 +46,10 @@ the command only data the device wrote is invalidated, so the source of a write
 stays as the CPU has it. A command answered with BUSY or TASK SET FULL is sent
 again after a pause. Root window reads each take their own bounce buffer.
 
+A window device is read-only and reports a solid state medium (`Device
+Characteristics`, `Medium Type`), which XNU reads through DKIOCISSOLIDSTATE for
+its I/O throttle periods, read-ahead and page-in cluster sizes.
+
 `native_ufs_dme_get` reads UniPro attributes. The sheng link runs HS-G5 Rate A
 on two lanes in FAST mode, as the boot firmware leaves it.
 

@@ -4,6 +4,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
+#include <IOKit/storage/IOStorageDeviceCharacteristics.h>
 #include <libkern/crypto/sha2.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_map.h>
@@ -2168,6 +2169,15 @@ bool NativeUfsBlock::start (IOService *provider)
   if (!bounceFree || !windowLock || !IOBlockStorageDevice::start (provider)) {
     return false;
   }
+  // The medium is flash. IOMediaBSDClient answers DKIOCISSOLIDSTATE from this dictionary, found from any media above this device;
+  // without it XNU treats the disk as rotating (throttle periods, read-ahead and page-in cluster sizes, the mount's MNTK_SSD).
+  OSDictionary *characteristics = OSDictionary::withCapacity (1);
+  OSString *medium = OSString::withCString (kIOPropertyMediumTypeSolidStateKey);
+  if (characteristics && medium && characteristics->setObject (kIOPropertyMediumTypeKey, medium)) {
+    setProperty (kIOPropertyDeviceCharacteristicsKey, characteristics);
+  }
+  OSSafeReleaseNULL (medium);
+  OSSafeReleaseNULL (characteristics);
   online = true;
   registerService ();
   return true;
