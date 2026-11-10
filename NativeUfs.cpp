@@ -1204,10 +1204,10 @@ static bool hostBringUp (const char **why)
   if (!hostStopQueue (why)) return false;
   smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, gHost.dmaBytes);
   gHost.smmu = gHost.smmuMap->getVirtualAddress ();
-  // The board's WiFi endpoint (sheng-wifi=2 or more) needs a pass-through stream of its own, set up here with the same code and at the same moment as the
+  // The board's WiFi endpoint (wifi=2 or more) needs a pass-through stream of its own, set up here with the same code and at the same moment as the
   // storage stream: the registers of the stream matching group are not safe to touch from another thread later (a read of the first one never returned).
   uint32_t wifi = 0;
-  if (PE_parse_boot_argn ("sheng-wifi", &wifi, sizeof (wifi)) && wifi >= 2) {
+  if (PE_parse_boot_argn ("wifi", &wifi, sizeof (wifi)) && wifi >= 2) {
     static OSSharedPtr<IOMemoryMap> extraMap;   // kept: the fault registers are read from it later
     uint32_t extraReport[3] = { 0, 0, 0 };
     smmuBypassStream (0x1401, extraMap, extraReport, 0x9c900000ULL, 8ULL << 20);
@@ -1234,7 +1234,7 @@ static bool hostBringUp (const char **why)
       const uint64_t tablesPa = tables->getPhysicalSegment (0, nullptr, kIOMemoryMapperNone);
       l1[0] = (tablesPa + 4096) | 3;
       uint32_t attr = 0;
-      PE_parse_boot_argn ("sheng-wifi-attr", &attr, sizeof (attr));   // 1: normal non-cacheable, non-shareable memory for the endpoint's accesses
+      PE_parse_boot_argn ("wifi-attr", &attr, sizeof (attr));   // 1: normal non-cacheable, non-shareable memory for the endpoint's accesses
       const uint64_t share = attr == 1 ? 0 : (3ULL << 8);
       for (uint32_t i = 0; i < kExtraBlocks; ++i)
         l2[(kExtraIova >> 21) + i] = (bpa + i * kBlock) | (1ULL << 11) | (1ULL << 10) | share | (1ULL << 6) | 1;   // block, non-global, AF, inner shareable, readable and writable by unprivileged requesters, attribute index 0
@@ -1285,11 +1285,11 @@ static bool hostBringUp (const char **why)
     }
     native_ufs_extra_stream = 0x80000000U | extraReport[0];
   }
-  // The display's streams (sheng-dpu=2 or more, or sheng-dpu-scanout), read here for the same reason: what the boot loader left for 0x1c00 and 0x1c02 (`iommus =
+  // The display's streams (dpu=2 or more, or dpu-scanout), read here for the same reason: what the boot loader left for 0x1c00 and 0x1c02 (`iommus =
   // <&apps_smmu 0x1c00 0x2>`), the first step of letting the display fetch the compositor's pages. Nothing is written.
   uint32_t dpu = 0, scanout = 0;
-  PE_parse_boot_argn ("sheng-dpu", &dpu, sizeof (dpu));
-  PE_parse_boot_argn ("sheng-dpu-scanout", &scanout, sizeof (scanout));
+  PE_parse_boot_argn ("dpu", &dpu, sizeof (dpu));
+  PE_parse_boot_argn ("dpu-scanout", &scanout, sizeof (scanout));
   if (dpu >= 2 || scanout) {
     const uintptr_t s = gHost.smmu;
     const uint32_t idr0 = read32 (s, 0x20), idr1 = read32 (s, 0x24);
@@ -1317,7 +1317,7 @@ static bool hostBringUp (const char **why)
       }
     }
     native_ufs_dpu_smmu[0] = 0x80000000U | groups | (valid << 8) | (banks << 16);
-    // sheng-dpu-scanout=1 or more: stage 1 for the display's bank (i562: bank 3, CBAR type 1, SCTLR 0xe0 = translation off, so the display
+    // dpu-scanout=1 or more: stage 1 for the display's bank (i562: bank 3, CBAR type 1, SCTLR 0xe0 = translation off, so the display
     // fetched physical addresses; its pipe address registers are 32-bit and every kernel allocation is above 4 GiB). The table keeps
     // 0x80000000..0xffffffff as it was (two 1 GiB identity blocks, so the boot loader's scanout at 0xb8000000 carries on unchanged) and adds
     // kDpuSlots windows of kDpuSlotBytes at kDpuWindow for the compositor's surfaces, filled by native_ufs_dpu_map. Undone at once when the
@@ -1407,9 +1407,9 @@ static uint32_t be32w (const uint8_t *at)
 
 }
 
-// ---- Persistent Data store window (sheng-data-persist) ----------------------------------------------------------
+// ---- Persistent Data store window (data-persist) ----------------------------------------------------------
 // The only part of this driver that ever writes. The consumer (NativeRamBlock's overlay) asks for a window of the given
-// size at the END of the userdata partition. Mode 1 (boot argument sheng-data-persist=1) only reads: it proves the window and
+// size at the END of the userdata partition. Mode 1 (boot argument data-persist=1) only reads: it proves the window and
 // lets the consumer inspect its header. Mode 2 additionally opens the write window. A window is refused unless it lies inside
 // the partition, clear of the flashed root image plus a 4 MiB guard, and is at most a quarter of the partition.
 namespace {
@@ -1420,14 +1420,14 @@ struct StoreGeometry {
 };
 StoreGeometry gStoreGeometry;
 uint64_t gStoreRegionFirst, gStoreRegionBlocks;
-// The diagnostic log (sheng-log=1): always the last 32 MiB of userdata, so the Data store's place does not depend on logging.
+// The diagnostic log (log=1): always the last 32 MiB of userdata, so the Data store's place does not depend on logging.
 constexpr uint64_t kLogReserveBlocks = 8192;
 // The log's export region: the 256 MiB just below the log window (the render server's pipeline caches, kits/sheng BootLog.c). It is
 // part of the log's write window, so the store ends below both.
 constexpr uint64_t kExportBlocks = 65536;
 uint64_t gLogRegionFirst, gLogRegionBlocks;
-// The reserve at the end of userdata that the Data store stays clear of: the log and its export region sit inside it (sheng-log=1), the rest
-// is unused. sheng-log-reserve=<MiB>, default 1024; 0 gives all the room to Data and is only accepted with the log off. The store's place
+// The reserve at the end of userdata that the Data store stays clear of: the log and its export region sit inside it (log=1), the rest
+// is unused. log-reserve=<MiB>, default 1024; 0 gives all the room to Data and is only accepted with the log off. The store's place
 // depends on it, so an image keeps one value for its whole life (a different value moves the store: the old one is read as blank).
 constexpr uint32_t kDefaultReserveMiB = 1024;
 static uint64_t reserveBlocks (void)
@@ -1435,7 +1435,7 @@ static uint64_t reserveBlocks (void)
   static int64_t cached = -1;
   if (cached < 0) {
     uint32_t mib = kDefaultReserveMiB;
-    if (!PE_parse_boot_argn ("sheng-log-reserve", &mib, sizeof (mib)) || mib > 16384) mib = kDefaultReserveMiB;
+    if (!PE_parse_boot_argn ("log-reserve", &mib, sizeof (mib)) || mib > 16384) mib = kDefaultReserveMiB;
     cached = static_cast<int64_t> (mib) * 256;   // 4096-byte blocks
   }
   return static_cast<uint64_t> (cached);
@@ -1446,7 +1446,7 @@ static unsigned storeMode (void)
   static int cached = -1;
   if (cached < 0) {
     uint32_t value = 0;
-    if (!PE_parse_boot_argn ("sheng-data-persist", &value, sizeof (value)) || value > 2) value = 0;
+    if (!PE_parse_boot_argn ("data-persist", &value, sizeof (value)) || value > 2) value = 0;
     cached = static_cast<int> (value);
   }
   return static_cast<unsigned> (cached);
@@ -1564,11 +1564,11 @@ extern "C" uint8_t *native_ufs_extra_va = nullptr;
 extern "C" volatile uint32_t native_ufs_extra_uncached = 0;
 extern "C" volatile uint32_t native_ufs_extra_iova = 0, native_ufs_extra_bytes = 0;
 extern "C" volatile uint32_t native_ufs_extra_atos[8] = { 0, 0, 0, 0 };
-// The display streams' state as the boot loader left it (sheng-dpu=2): [0] bit 31 read, stream-match groups | valid ones << 8 | context banks << 16;
+// The display streams' state as the boot loader left it (dpu=2): [0] bit 31 read, stream-match groups | valid ones << 8 | context banks << 16;
 // [1] sCR0, [2] IDR0, [3] IDR1; for 0x1c00 at [4] and 0x1c02 at [13]: group | bank << 16 (all ones: no match), SMR, S2CR, CBAR, CBA2R, SCTLR,
 // TTBR0 low, high, TCR; [22], [23] the two banks' FSR.
 extern "C" volatile uint32_t native_ufs_dpu_smmu[24] = {};
-// The display bank's stage 1 (sheng-dpu-scanout): bit 31 on, low bits the bank; 0xdead000n the step that refused it (1 bank not as expected,
+// The display bank's stage 1 (dpu-scanout): bit 31 on, low bits the bank; 0xdead000n the step that refused it (1 bank not as expected,
 // 2 no memory, 3 the bank ignored the table registers, 4 TLB sync timeout, 5 the display's fetches faulted with translation on).
 extern "C" volatile uint32_t native_ufs_dpu_state = 0;
 // TTBR0 low and TCR read back, FSR before and after the 50 ms watch, FAR low and high and FSYNR0 of the first fault, us watched.
@@ -1660,7 +1660,7 @@ extern "C" int native_ufs_extra_fault (uint32_t *out)
   return 1;
 }
 
-// ---- Diagnostic log window (sheng-log=1) --------------------------------------------------------------------------
+// ---- Diagnostic log window (log=1) --------------------------------------------------------------------------
 // The board's log writer (kits/sheng BootLog.c) gets the last kLogReserveBlocks of userdata and the kExportBlocks below them, refused
 // unless the partition holds them clear of the flashed root image plus a 4 MiB guard. Off without the boot argument.
 static unsigned logMode (void)
@@ -1668,7 +1668,7 @@ static unsigned logMode (void)
   static int cached = -1;
   if (cached < 0) {
     uint32_t value = 0;
-    if (!PE_parse_boot_argn ("sheng-log", &value, sizeof (value)) || value > 1) value = 0;
+    if (!PE_parse_boot_argn ("log", &value, sizeof (value)) || value > 1) value = 0;
     cached = static_cast<int> (value);
   }
   return static_cast<unsigned> (cached);
