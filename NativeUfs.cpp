@@ -27,6 +27,9 @@ extern const uint8_t verified_root_key[];
 #include <IOKit/IOBSD.h>
 #include <kern/thread.h>
 #include <kern/sched_prim.h>
+extern "C" {
+#include <kern/ast.h>   // ast_pending: no C linkage block of its own
+}
 #include <machine/machine_routines.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -40,6 +43,7 @@ extern const uint8_t verified_root_key[];
 #include "GccUfs.h"
 #include "RootDiagnostics.h"
 #include "TransferPoll.h"
+#include "CompletionWait.h"
 #include "SmmuTakeover.h"
 
 static UfsRootDiagnostics gRootDiagnostic;
@@ -994,6 +998,7 @@ static void hostWrite (unsigned offset, uint32_t value)
 static uint32_t hostCompletionCount (unsigned slot);
 static bool hostInterruptMode (void);
 static void hostWaitCompletion (unsigned slot, uint32_t seen, uint64_t started);
+static void hostWaitDone (uint64_t started);
 static uint64_t hostDmaAddress (const void *va);
 #include "RootCommands.h"
 
@@ -1001,8 +1006,13 @@ static uint64_t hostDmaAddress (const void *va);
 // The controller's interrupt (GIC SPI 265, level) with only UTRCS enabled (IE bit 0), as in UFSHCI's legacy doorbell mode under Linux
 // ufshcd. The handler clears UTRCS, then, like ufshcd's completion of the requests whose doorbell bits cleared, finds the outstanding
 // commands whose bits are clear and wakes only their waiters; a waiter rechecks its own doorbell bit and OCS. A wait polls for its
-// spin budget (gSpinUs) first and then sleeps until its slot's completion. Bring-up and the panic path always poll; without the
-// interrupt (attach refused) the host polls as before.
+// spin budget (gSpinUs) first and then sleeps until its slot's completion (CompletionWait.h; boot-arg native-ufs-wait selects how it
+// polls). Bring-up and the panic path always poll; without the interrupt (attach refused) the host polls as before.
+//
+// Why the polls spin: a command takes about 100 us here, and on this platform a thread that blocks takes 30 to 37 us on average to run
+// again, whether a timer or the completion interrupt ends the block (pauses and wakes of the log's UFS row). Sleeping on every
+// completion halved small-block throughput against polling, and pausing with IODelay (2) blocks on a timer 2 to 3 times per command,
+// because the cores register no idle exit latency (ml_delay_should_spin), and each block is charged to the task as a wakeup.
 extern "C" IOReturn armcpu_spi_attach (uint32_t, bool, void (*) (void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 extern "C" IOReturn armcpu_spi_mask (uint32_t, bool) __attribute__((weak_import));
 constexpr uint32_t kUfsIrq = 265 + 32;
@@ -1015,28 +1025,47 @@ static uint32_t hostCompletionCount (unsigned slot) { return __atomic_load_n (&g
 static bool hostInterruptMode (void) { return gIrqMode && !gHostPanic; }
 static uint64_t gSpinTicks = 0;
 static uint32_t gSpinTicksUs = ~0U;
+static uint32_t gWaitMode = kUfsWaitSpin;   // boot-arg native-ufs-wait (CompletionWait.h)
 // Completion wait statistics, for the log (native_ufs_stats_text).
-// The pause between two polls is IODelay (2). XNU's delay spins only when the delay is shorter than the idle exit latency the CPU was
-// registered with (ml_delay_should_spin, from ml_processor_info_t.powergate_latency); on a CPU registered without one it blocks the
-// thread on a timer, so a pause then lasts longer than 2 us and its end is charged to the calling task as an interrupt wakeup.
-// gWaitPauses and gWaitPauseTicks record what the pauses cost on the running platform. gIrqWakes, gIrqWakeTicks and gIrqWakeMaxTicks
+// A paced pause is IODelay (2). XNU's delay spins only when the delay is shorter than the idle exit latency the CPU was registered with
+// (ml_delay_should_spin, from ml_processor_info_t.powergate_latency); on a CPU registered without one it blocks the thread on a timer,
+// so a pause then lasts longer than 2 us and its end is charged to the calling task as an interrupt wakeup.
+// gWaitPauses and gWaitPauseTicks record what the paced pauses cost on the running platform. gSlotSpin counts the spinning pauses and
+// their time per slot, written only by the slot's waiter, so a spin touches no shared cache line. gWaitYields counts the spins that
+// ended in a sleep because a preemption was pending, gWaitRange the time from the start of a wait to the poll that saw its command
+// complete. gIrqWakes, gIrqWakeTicks and gIrqWakeMaxTicks
 // record the sleeps the interrupt ended and the time from the handler first seeing the completion to the waiter running again;
 // gIrqTimeouts the sleeps that ran into their timeout.
 // gSlotDoneAt holds that first sighting: the waiter clears it before it sleeps and the handler fills it only while it is clear, since
 // every later interrupt sees the same command complete again until its waiter has run.
 static volatile uint64_t gWaitPauses = 0, gWaitPauseTicks = 0, gIrqWakes = 0, gIrqWakeTicks = 0, gIrqWakeMaxTicks = 0, gIrqTimeouts = 0;
+static volatile uint64_t gWaitYields = 0, gWaitRange[kUfsWaitRanges] = {};
+struct alignas (64) UfsSlotSpin { volatile uint64_t pauses, ticks; };
+static UfsSlotSpin gSlotSpin[kSlots];
 static volatile uint64_t gSlotDoneAt[kSlots] = {};
 static void hostWaitCompletion (unsigned slot, uint32_t seen, uint64_t started)
 {
   const uint32_t spinUs = *static_cast<volatile uint32_t *> (&gSpinUs);
   if (spinUs != gSpinTicksUs) { nanoseconds_to_absolutetime (uint64_t (spinUs) * 1000, &gSpinTicks); gSpinTicksUs = spinUs; }
   const uint64_t now = mach_absolute_time ();
-  if (!hostInterruptMode () || now - started < gSpinTicks || !ml_get_interrupts_enabled ()) {
+  const bool canBlock = preemption_enabled ();   // interrupts on and preemption level 0
+  // A stale read after a migration only moves the switch to sleeping by one pause.
+  const bool preemptPending = canBlock && (*ast_pending () & AST_PREEMPTION) != 0;
+  const UfsWaitStep step = ufsWaitStep (gWaitMode, hostInterruptMode (), canBlock, preemptPending, now - started, gSpinTicks);
+  if (step == UfsWaitStep::Spin) {
+    __builtin_arm_wfe ();
+    UfsSlotSpin &spin = gSlotSpin[slot];
+    spin.pauses = spin.pauses + 1;
+    spin.ticks = spin.ticks + (mach_absolute_time () - now);
+    return;
+  }
+  if (step == UfsWaitStep::Pause) {
     IODelay (2);
     __atomic_fetch_add (&gWaitPauses, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add (&gWaitPauseTicks, mach_absolute_time () - now, __ATOMIC_RELAXED);
     return;
   }
+  if (preemptPending && gWaitMode == kUfsWaitSpin && now - started < gSpinTicks) __atomic_fetch_add (&gWaitYields, 1, __ATOMIC_RELAXED);
   __atomic_store_n (&gSlotDoneAt[slot], 0, __ATOMIC_RELAXED);
   assert_wait_timeout ((event_t) (uintptr_t) &gSlotGen[slot], THREAD_UNINT, 1000, NSEC_PER_USEC);
   if (hostCompletionCount (slot) != seen) {
@@ -1056,6 +1085,13 @@ static void hostWaitCompletion (unsigned slot, uint32_t seen, uint64_t started)
   __atomic_fetch_add (&gIrqWakeTicks, late, __ATOMIC_RELAXED);
   uint64_t longest = __atomic_load_n (&gIrqWakeMaxTicks, __ATOMIC_RELAXED);
   while (late > longest && !__atomic_compare_exchange_n (&gIrqWakeMaxTicks, &longest, late, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+}
+
+static void hostWaitDone (uint64_t started)
+{
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds (mach_absolute_time () - started, &ns);
+  __atomic_fetch_add (&gWaitRange[ufsWaitRange (ns / 1000)], 1, __ATOMIC_RELAXED);
 }
 
 static void hostInterrupt (void *)
@@ -1094,6 +1130,9 @@ extern "C" void native_ufs_set_spin (uint32_t us) { gSpinUs = us; }
 static void hostEnableInterrupt (void)
 {
   if (gIrqMode || !&armcpu_spi_attach || !&armcpu_spi_mask) return;
+  uint32_t mode = kUfsWaitSpin, spinUs = 0;
+  if (PE_parse_boot_argn ("native-ufs-wait", &mode, sizeof (mode)) && mode <= kUfsWaitSleep) gWaitMode = mode;
+  if (PE_parse_boot_argn ("native-ufs-spin-us", &spinUs, sizeof (spinUs))) gSpinUs = spinUs;
   if (armcpu_spi_attach (kUfsIrq, false, hostInterrupt, nullptr, nullptr, nullptr) != kIOReturnSuccess) return;
   hostWrite (0x24, 1);                      // UTRCE only
   if (armcpu_spi_mask (kUfsIrq, false) != kIOReturnSuccess) { hostWrite (0x24, 0); return; }
@@ -2263,7 +2302,14 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
 //   direct, staged    data commands straight to or from the caller's pages, and through the slot's data area with a copy
 //   busy              commands the device answered with BUSY or TASK SET FULL and the driver sent again
 //   long k/n          the longest store call (native_ufs_store_max_ticks): r read, w write, s cache flush, and its blocks
-//   pauses n/us       poll pauses of the completion waits and their total time (2 us each where the delay spins)
+//   pauses n/us       IODelay (2) poll pauses of the completion waits and their total time (2 us each where the delay spins)
+//   spins n/us        spinning poll pauses (one WFE each) and their total time
+//   yields            spins that ended in a sleep because a preemption was pending on the CPU
+//   done a/b/c/d/e    waits whose command completed under 50, 100, 200, 400 us after the wait began, and later
+//   old ms/op/slot    the oldest command in flight now: its age, opcode (hex) and slot; old=0 when none is out
+//   takers            threads waiting for a free command slot now
+//   poison p/r/op     1 once a command timed out or the controller reported a fatal error (every later command is refused), with
+//                     that command's IOReturn and opcode (hex)
 //   irqs, sleeps      completion interrupts taken, and waits that slept for one
 //   wakes n/us max    sleeps the interrupt ended, the total and the longest time from the interrupt to the waiter running again
 //   timeouts          sleeps that ended on their 1 ms timeout instead
@@ -2281,10 +2327,23 @@ extern "C" void native_ufs_stats_text (char *out, size_t size)
   const unsigned long long verified = 0;
 #endif
   const uint32_t kind = __atomic_load_n (&gStoreMaxKind, __ATOMIC_RELAXED);
-  snprintf (out, size, "UFS direct=%llu staged=%llu busy=%llu long=%c/%u pauses=%llu/%lluus irqs=%llu sleeps=%llu wakes=%llu/%lluus "
+  uint64_t spins = 0, spinTicks = 0, oldest = 0;
+  unsigned oldSlot = 0;
+  for (unsigned slot = 0; slot < kSlots; ++slot) { spins += gSlotSpin[slot].pauses; spinTicks += gSlotSpin[slot].ticks; }
+  const uint64_t now = mach_absolute_time ();
+  for (unsigned slot = 0; slot < kSlots; ++slot) {
+    const uint64_t at = __atomic_load_n (&gSlotIssuedAt[slot], __ATOMIC_RELAXED);
+    if (at && at < now && now - at > oldest) { oldest = now - at; oldSlot = slot; }
+  }
+  snprintf (out, size, "UFS direct=%llu staged=%llu busy=%llu long=%c/%u pauses=%llu/%lluus spins=%llu/%lluus yields=%llu "
+            "done=%llu/%llu/%llu/%llu/%llu old=%llu/%x/%u takers=%u poison=%u/%x/%x irqs=%llu sleeps=%llu wakes=%llu/%lluus "
             "max=%lluus timeouts=%llu win=%llu/%lluM/%llums wait=%llu/%llums vb=%llu",
             count (gDirectCommands), count (gStagedCommands), count (gBusyRetries), kind ? static_cast<char> (kind) : '-',
             __atomic_load_n (&gStoreMaxBlocks, __ATOMIC_RELAXED), count (gWaitPauses), us (count (gWaitPauseTicks)),
+            static_cast<unsigned long long> (spins), us (spinTicks), count (gWaitYields), count (gWaitRange[0]), count (gWaitRange[1]),
+            count (gWaitRange[2]), count (gWaitRange[3]), count (gWaitRange[4]), us (oldest) / 1000,
+            oldest ? gSlotOpcode[oldSlot] : 0U, oldest ? oldSlot : 0U, gSlotWaitersNow, gHost.poisoned ? 1U : 0U,
+            gHost.poisoned ? gRootDiagnostic.result : 0U, gHost.poisoned ? gRootDiagnostic.opcode : 0U,
             count (native_ufs_irqs), count (native_ufs_irq_sleeps), count (gIrqWakes), us (count (gIrqWakeTicks)),
             us (count (gIrqWakeMaxTicks)), count (gIrqTimeouts), count (gWindowRequests), count (gWindowBytes) >> 20,
             us (count (gWindowTicks)) / 1000, count (gBounceWaits), us (count (gBounceWaitTicks)) / 1000, verified);

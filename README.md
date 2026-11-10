@@ -36,8 +36,22 @@ a full pool hands a freed slot to its oldest waiter.
 
 Completion uses the controller interrupt (GIC SPI 265) with UTRCE and the UTRD
 interrupt bit, as Linux ufshcd. The handler wakes the waiters of the commands
-whose doorbell bits cleared. A wait polls for its first 200 microseconds, then
-sleeps. Bring-up and the panic path poll.
+whose doorbell bits cleared. A wait polls for its first 200 microseconds
+without blocking, one WFE between two polls, and sleeps on the interrupt after
+that or as soon as a preemption is pending on its CPU. Bring-up and the panic
+path poll with `IODelay`.
+
+| Boot argument | Effect |
+| --- | --- |
+| `native-ufs-wait=1` | Default: spin for the budget, then sleep |
+| `native-ufs-wait=0` | Pause with `IODelay(2)` for the budget, then sleep (the earlier behaviour) |
+| `native-ufs-wait=2` | Sleep on the interrupt from the first pause |
+| `native-ufs-spin-us=N` | Spin budget in microseconds (default 200) |
+
+A command takes about 100 us on sheng, and a blocked thread takes 30 to 37 us
+on average to run again after a timer or the completion interrupt. `IODelay(2)`
+blocks on a timer on these cores (they register no idle exit latency), so the
+paced mode blocks two to three times per command.
 
 Page-aligned buffers are read and written by DMA straight into their pages
 through a PRDT of up to 64 entries and 1 MiB per command; other buffers use the
@@ -62,7 +76,13 @@ on two lanes in FAST mode, as the boot firmware leaves it.
 | `direct`, `staged` | Data commands on the caller's pages, and through the slot's data area |
 | `busy` | Commands answered with BUSY or TASK SET FULL and sent again |
 | `long k/n` | The longest store call: `r` read, `w` write, `s` cache flush, and its blocks |
-| `pauses n/us` | Poll pauses of completion waits and their total time |
+| `pauses n/us` | `IODelay(2)` poll pauses of completion waits and their total time |
+| `spins n/us` | Spinning poll pauses (one WFE each) and their total time |
+| `yields` | Spins that ended in a sleep because a preemption was pending |
+| `done a/b/c/d/e` | Waits whose command completed under 50, 100, 200, 400 us, and later |
+| `old ms/op/slot` | The oldest command in flight now: age, opcode (hex), slot; 0 when none |
+| `takers` | Threads waiting for a free command slot now |
+| `poison p/r/op` | 1 after a timeout or fatal status (later commands are refused), with its IOReturn and opcode |
 | `irqs`, `sleeps` | Completion interrupts, and waits that slept for one |
 | `wakes n/us`, `max` | Sleeps the interrupt ended, total and longest time until the waiter ran |
 | `timeouts` | Sleeps that ended on their 1 ms timeout |
@@ -70,13 +90,15 @@ on two lanes in FAST mode, as the boot firmware leaves it.
 | `wait n/ms` | Root window requests that waited for a bounce buffer |
 | `vb` | Integrity blocks verified |
 
-A poll pause is `IODelay(2)`. XNU spins for it only on a CPU registered with an
-idle exit latency above the delay; otherwise the thread blocks on a timer, and
-`pauses` shows the cost.
+A paced pause is `IODelay(2)`. XNU spins for it only on a CPU registered with
+an idle exit latency above the delay; otherwise the thread blocks on a timer,
+and `pauses` shows the cost. Every command wait ends by its deadline (1 s read,
+2 s write, 10 s cache flush); one that runs out poisons the host.
 
 ## Tests
 
-`tests/RootCommands.cpp` runs the production command code against a host model:
+`tests/CompletionWait.cpp` drives the completion wait policy through the
+production poll loop. `tests/RootCommands.cpp` runs the production command code against a host model:
 per-slot entries, descriptors, tags and data, the pool, busy retries, the panic
 slot and the one-slot fallback. `tests/check_arm64_root_commands.py` runs it on
 QEMU's UFS controller at EL1 with real cache maintenance, including eight

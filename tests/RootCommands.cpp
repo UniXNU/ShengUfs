@@ -42,6 +42,7 @@ static uint64_t io(unsigned op,uint64_t address,uint64_t value,void *bytes)
       if (fault==Fault::Timeout) return 0;
       uint8_t *cmd=device.data()+ufsSlotUcdOffset(slot), *rsp=cmd+kRspOffset;
       if (cmd[0]==1) assert(cmd[3]==entry);            // SCSI task tag: the request list entry
+      assert(gSlotOpcode[slot]==cmd[cmd[0]==1?16:12]);   // the log's record of the command in flight
       std::fill(rsp,rsp+512,0);
       if (cmd[0]==1 && cmd[16]==0x2a) {                 // WRITE(10): keep what the data area held
         const uint32_t n=uint32_t(cmd[23])<<8|cmd[24];
@@ -104,6 +105,7 @@ int main()
   assert(ufs_test_read(0,1,32,out.data())==0);
   assert(std::all_of(out.begin(),out.end(),[](uint8_t x){return x==0x7b;}));
   assert(dataAcquired && gStagedCommands==1 && gDirectCommands==0);   // the host model has no zero copy
+  assert(gSlotOpcode[lastSlot]==0x28 && std::all_of(std::begin(gSlotIssuedAt),std::end(gSlotIssuedAt),[](uint64_t t){return t==0;}));
   assert(*reinterpret_cast<uint32_t *>(device.data()+20)==8);
   assert(*reinterpret_cast<uint32_t *>(device.data()+4096+1024+4)==8);
   assert(ufs_test_read(0,0xffffffffULL,1,out.data())==0); // Last READ(10) LBA is valid.
@@ -115,6 +117,7 @@ int main()
     assert(ufs_test_read(0,1,1,out.data())!=0);
     assert(std::all_of(out.begin(),out.end(),[](uint8_t x){return x==0xa5;}));
     assertQuarantined();
+    assert(std::all_of(std::begin(gSlotIssuedAt),std::end(gSlotIssuedAt),[](uint64_t t){return t==0;}));   // an ended wait clears it
   }
   reset(Fault::Query); value=0xabcdef;
   assert(ufs_test_query(3,2,&value)!=0 && value==0xabcdef); assertQuarantined();

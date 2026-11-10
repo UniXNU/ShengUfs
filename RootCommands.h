@@ -87,6 +87,10 @@ static constexpr uint32_t kXferMax = 1U << 20, kPrdMax = 256U << 10;
 static bool gZeroCopy = true;
 // Data commands by path, for the log: straight to or from the caller's pages, or through the slot's data area with a copy.
 static volatile uint64_t gDirectCommands = 0, gStagedCommands = 0;
+// Commands in flight, for the log: when each slot's doorbell rang (0 while the slot has no command out) and the command's opcode (the
+// SCSI opcode, or the UPIU transaction type for others). The log names the oldest, so a command that does not complete is visible.
+static volatile uint64_t gSlotIssuedAt[kSlots] = {};
+static volatile uint8_t gSlotOpcode[kSlots] = {};
 
 static IOReturn hostIssue (const UfsSlot &slot, uint32_t direction, uint32_t dataBytes, uint32_t timeoutUs, uint64_t *deadline,
                            uint32_t *ocs, const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr)
@@ -150,6 +154,8 @@ static IOReturn hostIssue (const UfsSlot &slot, uint32_t direction, uint32_t dat
   if (!hostInterruptMode ()) hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence. With interrupts the handler does.
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, deadline);
   __atomic_or_fetch (&gOutstanding, slot.bit, __ATOMIC_RELEASE);
+  gSlotOpcode[slot.index] = slot.ucd[slot.ucd[0] == 1 ? 16 : 12];
+  __atomic_store_n (&gSlotIssuedAt[slot.index], mach_absolute_time (), __ATOMIC_RELAXED);
   hostWrite (0x58, slot.bit);
   return kIOReturnSuccess;
 }
@@ -164,7 +170,11 @@ static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t dea
   HardwareTransferPort port = { slot, deadline, 0 };
   UfsTransferPoll state;
   UfsTransferEnd end = pollUfsTransfer (port, state);
-  if (end == UfsTransferEnd::Completed) __atomic_and_fetch (&gOutstanding, ~slot.bit, __ATOMIC_RELEASE);
+  __atomic_store_n (&gSlotIssuedAt[slot.index], 0, __ATOMIC_RELAXED);
+  if (end == UfsTransferEnd::Completed) {
+    __atomic_and_fetch (&gOutstanding, ~slot.bit, __ATOMIC_RELEASE);
+    hostWaitDone (port.started);
+  }
   gRootDiagnostic.polls = state.polls;
   gRootDiagnostic.dbSeen = state.doorbellSeen;
   gRootDiagnostic.isSeen = state.interruptSeen;
@@ -364,6 +374,7 @@ static IOLock *gSlotLock = nullptr;
 // Pool statistics (under gSlotLock): slots taken now, the most taken at once, takes that had to wait for a slot.
 static uint32_t gSlotsBusy = 0, gSlotsPeak = 0;
 static uint64_t gSlotWaits = 0;
+static volatile uint32_t gSlotWaitersNow = 0;   // takers waiting for a slot now, for the log
 // With the pool empty, takers queue in arrival order and a freed slot goes straight to the oldest of them (no thread can be passed over).
 struct UfsSlotWaiter { UfsSlotWaiter *next; int slot; };
 static UfsSlotWaiter *gSlotWaitHead = nullptr, *gSlotWaitTail = nullptr;
@@ -408,7 +419,9 @@ static UfsSlot hostSlotTake (bool *pooled)
     UfsSlotWaiter waiter = { nullptr, -1 };
     if (gSlotWaitTail) gSlotWaitTail->next = &waiter; else gSlotWaitHead = &waiter;
     gSlotWaitTail = &waiter;
+    __atomic_fetch_add (&gSlotWaitersNow, 1, __ATOMIC_RELAXED);
     while (waiter.slot < 0) IOLockSleep (gSlotLock, &waiter, THREAD_UNINT);
+    __atomic_fetch_sub (&gSlotWaitersNow, 1, __ATOMIC_RELAXED);
     index = static_cast<unsigned> (waiter.slot);
   }
   if (++gSlotsBusy > gSlotsPeak) gSlotsPeak = gSlotsBusy;
