@@ -2255,25 +2255,24 @@ static bool mediaWithUuidExists (const char *uuid, NativeUfsBlock *window)
   return found;
 }
 
-static void captureMissingMedia (const char *uuid)
+// What sits below the window in the service plane, matched or not (getMatchingServices lists only services whose matching has
+// finished, so media held up in matching would not show): each entry's class, BSD name, busy count and whether its matching is done.
+static void captureMissingMedia (const char *uuid, IOService *window)
 {
   int used = snprintf (gRootMediaText, sizeof (gRootMediaText), "Waiting for signed UUID %s\n", uuid);
-  OSDictionary *matching = IOService::serviceMatching ("IOMedia");
-  OSIterator *iterator = matching ? IOService::getMatchingServices (matching) : nullptr;
+  IORegistryIterator *children = window ? IORegistryIterator::iterateOver (window, gIOServicePlane, kIORegistryIterateRecursively) : nullptr;
   unsigned count = 0;
-  while (iterator && used < int (sizeof (gRootMediaText)) - 180 && count++ < 8) {
-    IOService *media = OSDynamicCast (IOService, iterator->getNextObject ());
-    if (!media) break;
-    OSString *id = OSDynamicCast (OSString, media->getProperty ("UUID"));
-    OSString *bsd = OSDynamicCast (OSString, media->getProperty (kIOBSDNameKey));
-    OSNumber *size = OSDynamicCast (OSNumber, media->getProperty ("Size"));
-    used += snprintf (gRootMediaText + used, sizeof (gRootMediaText) - used,
-                      "media %.24s bytes=%llx uuid=%.36s\n",
-                      bsd ? bsd->getCStringNoCopy () : "-", size ? size->unsigned64BitValue () : 0ULL,
+  while (children && used < int (sizeof (gRootMediaText)) - 160 && count++ < 8) {
+    IOService *entry = OSDynamicCast (IOService, children->getNextObject ());
+    if (!entry) break;
+    OSString *id = OSDynamicCast (OSString, entry->getProperty ("UUID"));
+    OSString *bsd = OSDynamicCast (OSString, entry->getProperty (kIOBSDNameKey));
+    used += snprintf (gRootMediaText + used, sizeof (gRootMediaText) - used, "%.32s %.12s busy=%u matched=%u uuid=%.36s\n",
+                      entry->getMetaClass ()->getClassName (), bsd ? bsd->getCStringNoCopy () : "-", entry->getBusyState (),
+                      entry->isInactive () ? 2u : (entry->getState () & kIOServiceMatchedState) ? 1u : 0u,
                       id ? id->getCStringNoCopy () : "-");
   }
-  OSSafeReleaseNULL (iterator);
-  OSSafeReleaseNULL (matching);
+  OSSafeReleaseNULL (children);
 }
 
 // Used only for objects that were never started/published. Started objects
@@ -2314,7 +2313,7 @@ static void publishThread (void *, wait_result_t)
         if (ready || tick == 300) break;
         if (tick && tick % 50 == 0) {
           // Every 5 s: what the IOKit side has published so far, and whether the window's own matching is still busy.
-          captureMissingMedia (uuid);
+          captureMissingMedia (uuid, device);
           IOLog ("NativeUfs: %s volume %s still missing after %u s, window busy %u\n%s", device->windowLabel (), uuid,
                  tick / 10, device->getBusyState (), gRootMediaText);
         }
@@ -2322,7 +2321,7 @@ static void publishThread (void *, wait_result_t)
       }
       IOLog ("NativeUfs: %s volume %s %s\n", device->windowLabel (), uuid, ready ? "ready" : "not ready");
       if (!ready) {
-        captureMissingMedia (uuid);
+        captureMissingMedia (uuid, device);
         IOLog ("NativeUfs: media at timeout, window busy %u\n%s", device->getBusyState (), gRootMediaText);
       }
       return ready;
