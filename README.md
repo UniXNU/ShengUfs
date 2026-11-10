@@ -64,6 +64,24 @@ A window device is read-only and reports a solid state medium (`Device
 Characteristics`, `Medium Type`), which XNU reads through DKIOCISSOLIDSTATE for
 its I/O throttle periods, read-ahead and page-in cluster sizes.
 
+## Verified-root tables
+
+Every window block is checked against its SHA-256 in the owner-signed table
+before it is served. A header-only policy keeps its table in the root image
+object `<window>.vroot`. At bring-up the whole table is read once and checked
+against the digest in the signed header; only a SHA-256 of each 4096-byte table
+page stays in memory, read-only (32 bytes per 512 KiB of image). A block's table
+page then comes from a wired cache shared by all windows, or is read from the
+object on LUN 0 through the transport (never through a window), checked against
+its kept page hash and cached. A table page that does not match is not cached and
+every block it covers is refused. The cache is allocated before the windows are
+published, so a page-in under memory pressure fills it without allocating.
+
+| Boot argument | Effect |
+| --- | --- |
+| `native-vroot-cache=N` | Table page cache in MiB (default 8: 2048 pages, 1 GiB of image) |
+| `native-vroot-cache=0` | Keep every window's whole table wired, no cache |
+
 `native_ufs_dme_get` reads UniPro attributes. The sheng link runs HS-G5 Rate A
 on two lanes in FAST mode, as the boot firmware leaves it.
 
@@ -89,6 +107,8 @@ on two lanes in FAST mode, as the boot firmware leaves it.
 | `win n/MiB/ms` | Root window requests, their bytes and their time |
 | `wait n/ms` | Root window requests that waited for a bounce buffer |
 | `vb` | Integrity blocks verified |
+| `vt h/m/r/e/w/f` | Table cache hits, misses, table page reads, evictions, waits for a page or entry being filled, refused table pages |
+| `vtc n/KiB` | Table cache pages (0 with `native-vroot-cache=0`) and wired verified-root memory in KiB |
 
 A paced pause is `IODelay(2)`. XNU spins for it only on a CPU registered with
 an idle exit latency above the delay; otherwise the thread blocks on a timer,
@@ -103,6 +123,10 @@ per-slot entries, descriptors, tags and data, the pool, busy retries, the panic
 slot and the one-slot fallback. `tests/check_arm64_root_commands.py` runs it on
 QEMU's UFS controller at EL1 with real cache maintenance, including eight
 outstanding commands and a 512 KiB zero-copy read.
+`tests/VerifiedTableCache.cpp` checks the table cache against `vr_verify_block`
+on the whole table, refusal of tampered and unreadable table pages, LRU eviction
+and concurrent fills; `tests/check_root_path_host.py --verified-root
+<UniXNU>/kits/VerifiedRoot` builds and runs it.
 
 ## Wi-Fi DMA window
 
