@@ -41,7 +41,9 @@ sleeps. Bring-up and the panic path poll.
 
 Page-aligned buffers are read and written by DMA straight into their pages
 through a PRDT of up to 64 entries and 1 MiB per command; other buffers use the
-slot's 128 KiB data area. A command answered with BUSY or TASK SET FULL is sent
+slot's 128 KiB data area. Data is cleaned to memory before the doorbell; after
+the command only data the device wrote is invalidated, so the source of a write
+stays as the CPU has it. A command answered with BUSY or TASK SET FULL is sent
 again after a pause. Root window reads each take their own bounce buffer.
 
 `native_ufs_dme_get` reads UniPro attributes. The sheng link runs HS-G5 Rate A

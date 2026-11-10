@@ -15,6 +15,7 @@ static std::array<uint8_t,kDmaBytes> device;
 static std::array<uint32_t,64> registers;
 static uint64_t now;
 static unsigned writes, releases;
+static bool dataAcquired;     // a data area was taken back from the device (the descriptor and the request list line are smaller)
 static bool released;
 
 static uint64_t io(unsigned op,uint64_t address,uint64_t value,void *bytes)
@@ -71,7 +72,7 @@ static uint64_t io(unsigned op,uint64_t address,uint64_t value,void *bytes)
     assert(address>=gHost.phys && address-gHost.phys+value<=device.size());
     auto at=device.data()+(address-gHost.phys);
     if (op==2) { ++releases; memcpy(at,bytes,value); released=true; }
-    else memcpy(bytes,at,value);
+    else { memcpy(bytes,at,value); if (value>=4096) dataAcquired=true; }
   }
   if (op==4) return now;
   if (op==5) now+=value;
@@ -79,7 +80,7 @@ static uint64_t io(unsigned op,uint64_t address,uint64_t value,void *bytes)
 }
 static void reset(Fault f=Fault::None)
 {
-  fault=f; device.fill(0); registers.fill(0); now=0; writes=releases=0; released=false;
+  fault=f; device.fill(0); registers.fill(0); now=0; writes=releases=0; released=false; dataAcquired=false;
   registers[0x34/4]=1; registers[0x30/4]=15; registers[0x60/4]=1;
   ufs_test_reset(io,0x8cb5e9000);
 }
@@ -152,7 +153,10 @@ int main()
   assert(ufs_test_free_slots()==(1U<<(kRegionSlots-1))-1-3);                                    // given back after the command
   ufs_test_slot_give(0); ufs_test_slot_give(1);
   assert(ufs_test_store_open(100,64)==1);
+  // A write leaves its data to the CPU: only what the device wrote (the response) is taken back after the command.
+  dataAcquired=false;
   { std::vector<uint8_t> data(8192,0x55); assert(ufs_test_write(0,110,2,data.data())==0 && written==data); }
+  assert(!dataAcquired);
   assert(ufs_test_sync()==0 && ufs_test_free_slots()==(1U<<(kRegionSlots-1))-1);
   reset(Fault::Busy); busyLeft=3; assert(ufs_test_read(0,1,1,out.data())==0 && !gHost.poisoned);
   reset(Fault::TaskSetFull); busyLeft=5; assert(ufs_test_store_open(100,64)==1);

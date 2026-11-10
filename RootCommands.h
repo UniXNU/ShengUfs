@@ -152,7 +152,12 @@ static IOReturn hostIssue (const UfsSlot &slot, uint32_t direction, uint32_t dat
   return kIOReturnSuccess;
 }
 
-static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t deadline, uint32_t *ocs, const void *buffer = nullptr)
+// `direction` is the command's UTRD data direction. Only data the device wrote (2) is invalidated after the command: the device does
+// not change the data of a write (1), which was cleaned to memory before the doorbell, so its cache lines need nothing (Linux's
+// arch_sync_dma_for_cpu returns at once for DMA_TO_DEVICE). An invalidate there would also drop a line a CPU wrote to the caller's
+// page while the command ran.
+static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t deadline, uint32_t *ocs, const void *buffer = nullptr,
+                           unsigned direction = 2)
 {
   HardwareTransferPort port = { slot, deadline, 0 };
   UfsTransferPoll state;
@@ -170,7 +175,7 @@ static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t dea
     return recordTransport (end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
   }
   cacheInvalidate (slot.ucd, kPrdtOffset);
-  if (dataBytes) cacheInvalidate (buffer ? buffer : slot.data, dataBytes);
+  if (dataBytes && direction != 1) cacheInvalidate (buffer ? buffer : slot.data, dataBytes);
   gRootDiagnostic.response = loadBe32 (slot.ucd + kRspOffset);
   return recordTransport (*ocs == 0 ? kIOReturnSuccess : kIOReturnIOError, *ocs);
 }
@@ -179,7 +184,7 @@ static IOReturn hostSubmit (const UfsSlot &slot, uint32_t direction, uint32_t da
 {
   uint64_t deadline = 0;
   IOReturn result = hostIssue (slot, direction, dataBytes, timeoutUs, &deadline, ocs);
-  return result != kIOReturnSuccess ? result : hostAwait (slot, dataBytes, deadline, ocs);
+  return result != kIOReturnSuccess ? result : hostAwait (slot, dataBytes, deadline, ocs, nullptr, direction);
 }
 
 static bool hostClearUcd (const UfsSlot &slot)
@@ -271,11 +276,11 @@ static IOReturn hostScsiIssue (const UfsSlot &slot, uint8_t lun, const uint8_t *
 }
 
 static IOReturn hostScsiAwait (const UfsSlot &slot, uint8_t lun, uint32_t dataBytes, uint64_t deadline, uint32_t *scsiStatus,
-                               const void *buffer = nullptr)
+                               const void *buffer = nullptr, unsigned direction = 2)
 {
   *scsiStatus = 0xffff;
   uint32_t ocs = 0xf;
-  IOReturn status = hostAwait (slot, dataBytes, deadline, &ocs, buffer);
+  IOReturn status = hostAwait (slot, dataBytes, deadline, &ocs, buffer, direction);
   if (status != kIOReturnSuccess) return status;
   const uint8_t tag = static_cast<uint8_t> (slot.entry);
   status = hostResponseHeader (slot, 0x21, lun, tag);
@@ -306,7 +311,8 @@ static IOReturn hostScsiDir (const UfsSlot &slot, uint8_t lun, const uint8_t *cd
 {
   uint64_t deadline = 0;
   IOReturn status = hostScsiIssue (slot, lun, cdb, cdbLength, direction, dataBytes, timeoutUs, &deadline, scsiStatus, prd, prds, buffer);
-  return status != kIOReturnSuccess ? status : hostScsiAwait (slot, lun, dataBytes, deadline, scsiStatus, prds ? buffer : nullptr);
+  return status != kIOReturnSuccess ? status
+                                    : hostScsiAwait (slot, lun, dataBytes, deadline, scsiStatus, prds ? buffer : nullptr, direction);
 }
 
 // The original read-only entry point: data, when present, always flows device -> host.
