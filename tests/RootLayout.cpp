@@ -105,20 +105,6 @@ int main(int argc,char **argv) {
   expect([&]{put32(manifest+8,2);put32(manifest+12,3);object(2,"OS",40960,4096);},true,5);        // name taken
   expect([&]{put32(manifest+8,2);put32(manifest+12,9);},true,2);
   expect([&]{put32(manifest+8,2);put32(manifest+12,3);object(2,"OS.vroot",40960,4096);put32(manifest+24+256+48,512);},true,7);
-  // Version 3 carries only the checksummed prefix, without legacy windows.
-  {
-    fixture(); memset(manifest+24,0,4064-24);
-    put32(manifest+8,3); put32(manifest+12,0); put64(manifest+16,4096); checksums();
-    RootLayout layout; const char *why=nullptr;
-    assert(findRootLayout(&layout,&why) && layout.manifestStatus==0);
-    assert(layout.imageBytes==4096 && layout.windows==0 && layout.objects==0);
-    manifest[4064]^=1;
-    assert(findRootLayout(&layout,&why) && layout.manifestStatus==3 && !layout.imageBytes);
-  }
-  expect([]{put32(manifest+8,3);},true,2);
-  expect([]{put32(manifest+12,0);},true,2);
-  expect([]{put32(manifest+8,2);put32(manifest+12,0);},true,2);
-  expect([]{put32(manifest+8,3);put32(manifest+12,0);put64(manifest+16,0);},true,4);
   // Bounded mutation pass checks parser memory safety, not semantic correctness.
   for(unsigned i=0;i<2048;++i) {
     fixture(); unsigned at=(i*313)%4064;manifest[at]^=uint8_t(1+(i%255));checksums();
@@ -135,5 +121,5 @@ int main(int argc,char **argv) {
     printf("PASS: existing root image's 4096-byte manifest, OS=%llu SystemOS=%llu; synthetic GPT uses recorded geometry, no full-image rehash\n",
            (unsigned long long)layout.window[0].size,(unsigned long long)layout.window[1].size);
   }
-  puts("PASS: GPT CRC/geometry/partition faults, manifest hashes/names/attributes/overlap/overflow, version 2 objects, version 3 prefix, 2048 bounded mutations");
+  puts("PASS: GPT CRC/geometry/partition faults, manifest hashes/names/attributes/overlap/overflow, version 2 objects, 2048 bounded mutations");
 }

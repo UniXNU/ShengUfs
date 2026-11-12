@@ -162,7 +162,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     layout->manifestStatus = 2;
     // Version 1 holds windows only. Version 2 adds data objects (flags 3, 4096-byte blocks), which are read
     // by the kernel and never published as block devices; a version 1 parser refuses such a manifest.
-    if ((version == 1 && n && n <= 4) || (version == 2 && n && n <= 8) || (version == 3 && n == 0)) {
+    if ((version == 1 && n && n <= 4) || (version == 2 && n && n <= 8)) {
       SHA256_CTX context;
       uint8_t digest[32];
       SHA256_Init (&context);
@@ -210,7 +210,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
           slot.size = size;
           memcpy (slot.sha256, entry + 56, 32);
         }
-        if (bounds && !layout->windows && version != 3) {
+        if (bounds && !layout->windows) {
           layout->manifestStatus = 7;
           bounds = false;
         }

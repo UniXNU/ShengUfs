@@ -12,26 +12,18 @@ for arm64e iOS 26. Verified-root read policy remains enabled. These archives
 still require family/APFS linkage and device qualification; they do not establish
 an iPadOS 26 root boot. See the [migration procedure](https://unixnu.com/porting/migration#source-drivers).
 
-The arm64e `build-arm-driver.py ShengUfs` entry selects
+The arm64e `build-arm-driver.py ShengUfs` entry now selects
 `build-sheng-source-storage.py`. It builds a deferred public-source
 IOBlockStorageDevice adapter and the board's SourceStorage runtime. The runtime
 loads the original IOStorageFamily and APFS, checks the original base class
-size, registers the source classes, and starts NativeUfs on the platform root.
-Its runtime metadata has a separate name and inherits the original storage
-metaclass; its C++ class name is preserved for
+size, authenticates the 23F84 policies, registers the source classes, and starts
+NativeUfs on the platform root. Its runtime metadata has a separate name and
+inherits the original storage metaclass; its C++ class name is preserved for
 compiler-generated arm64e pointer authentication.
 
-`native-source-storage=1 native-ufs-root=1` selects verified root windows. Their
-policies are authenticated before source-class registration. The root-policy
-bundle travels in `kernel.macho.vroot`; only the owner public anchor is linked
-into the kernel. On sheng this path serves the iPadOS 27.0.1 (24A446) root and Data.
-
-## APFS container storage
-
-`native-ufs-root=2` validates the userdata GPT and a version 3 SHNGROOT header
-with `count=0` and `image_bytes=4096`. ShengUfs records the persistent store and
-log geometry; RamBlock publishes the APFS disk. This mode publishes no root
-windows. With `root-container=1`, SourceStorage skips root-window policies.
+`native-source-storage=1 native-ufs-root=1` selects this path. The root policy
+tables travel in `kernel.macho.vroot`; only the owner public anchor is linked
+into the kernel. On sheng it serves the iPadOS 27.0.1 (24A446) root and Data.
 
 ## Command path
 
@@ -125,8 +117,6 @@ and `pauses` shows the cost. Every command wait ends by its deadline (1 s read,
 
 ## Tests
 
-`tests/RootLayout.cpp` checks SHNGROOT v3 headers, malformed hashes and counts,
-and rejection of empty v1/v2 manifests.
 `tests/CompletionWait.cpp` drives the completion wait policy through the
 production poll loop. `tests/RootCommands.cpp` runs the production command code against a host model:
 per-slot entries, descriptors, tags and data, the pool, busy retries, the panic
@@ -135,12 +125,8 @@ QEMU's UFS controller at EL1 with real cache maintenance, including eight
 outstanding commands and a 512 KiB zero-copy read.
 `tests/VerifiedTableCache.cpp` checks the table cache against `vr_verify_block`
 on the whole table, refusal of tampered and unreadable table pages, LRU eviction
-and concurrent fills. Run the root-path and table-cache suites from this repository:
-
-```sh
-python3 tests/check_root_path_host.py --output out/root-path \
-  --verified-root /path/to/UniXNU/kits/VerifiedRoot
-```
+and concurrent fills; `tests/check_root_path_host.py --verified-root
+<UniXNU>/kits/VerifiedRoot` builds and runs it.
 
 ## Wi-Fi DMA window
 
