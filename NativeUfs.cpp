@@ -2950,6 +2950,18 @@ bool NativeUfs::startRoot (IOService *provider)
   }
   gStoreGeometry = { true, layout->userdataFirst, layout->userdataLast, layout->imageBytes, layout->gptEntriesLba,
                      layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount };
+  unsigned rootMode = 0;
+  PE_parse_boot_argn("native-ufs-root", &rootMode, sizeof(rootMode));
+  if (rootMode == 2) {
+    // Version 3 describes only the reserved prefix. The APFS disk is served by RamBlock's store.
+    const bool valid = !layout->windows && !layout->objects && layout->imageBytes == 4096;
+    IOFree(layout, sizeof(RootLayout));
+    if (!valid) { gStoreGeometry.valid = false; return false; }
+    if (!IOService::start(provider)) { gStoreGeometry.valid = false; return false; }
+    registerService();
+    return true;
+  }
+  if (!layout->windows) { IOFree(layout, sizeof(RootLayout)); return false; }
   gRootObjects = layout->objects;
   for (unsigned i = 0; i < layout->objects; ++i) gRootObject[i] = layout->object[i];
   gRootObjectBase = layout->userdataFirst * 4096ULL;
