@@ -101,6 +101,14 @@ static uint32_t read32 (uintptr_t base, unsigned offset)
   return *reinterpret_cast<volatile uint32_t *> (base + offset);
 }
 
+// A context bank's output address size (TCR2 PASize) as the SMMU supports it: IDR2 OAS (bits 7:4), same encoding (0 32-bit, 1 36-bit,
+// 2 40-bit, 3 42-bit, 4 44-bit, 5 48-bit), at most 48-bit. A fixed 48-bit PASize is beyond an SMMU with a smaller output (the
+// Nothing Phone (3a)'s apps SMMU has 36 bits; Linux: "Stage-1: 36-bit VA -> 36-bit IPA"), and its walks then fault at level 0.
+static uint32_t smmuOutputSize (uintptr_t smmu)
+{
+  const uint32_t oas = (read32 (smmu, 0x28) >> 4) & 0xf;
+  return oas < 5 ? oas : 5;
+}
 static void write32 (uintptr_t base, unsigned offset, uint32_t value)
 {
   *reinterpret_cast<volatile uint32_t *> (base + offset) = value;
@@ -1314,7 +1322,7 @@ static bool hostBringUp (const char **why)
       uintptr_t cb = smmuBase + (pages + (extraReport[0] >> 16)) * 4096;
       write32 (cb, 0x0, 0);                               // stage 1 off while the table is set
       write32 (cb, 0x20, static_cast<uint32_t> (tablesPa)); write32 (cb, 0x24, static_cast<uint32_t> (tablesPa >> 32));
-      write32 (cb, 0x10, 5);                              // TCR2: 48-bit output
+      write32 (cb, 0x10, smmuOutputSize (smmuBase));     // TCR2: the SMMU's output size (IDR2 OAS)
       write32 (cb, 0x30, 32U | (1U << 23));               // T0SZ 32, non-cacheable walks, 4 KiB granule, no TTBR1
       write32 (cb, 0x38, attr == 1 ? 0x44 : 0xff);        // MAIR attribute 0: write-back (or non-cacheable)
       write32 (cb, 0x618, 0); write32 (cb, 0x7f0, 0);     // TLB invalidate all, sync
