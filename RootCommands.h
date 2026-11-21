@@ -600,3 +600,59 @@ static IOReturn hostSyncCache (void)
   return status;
 }
 
+// Runtime UFS Read Descriptor (opcode 0x01) on a pooled slot: safe alongside active block I/O.
+static IOReturn hostQueryReadDesc (uint8_t idn, uint8_t index, void *dst, uint32_t maxBytes, uint32_t *actualBytes)
+{
+  if (!gHost.ready || !dst || !maxBytes || maxBytes > 512 - 32) return kIOReturnBadArgument;
+  bool pooled;
+  const UfsSlot slot = hostSlotTake (&pooled);
+  if (!hostClearUcd (slot)) { hostSlotGive (slot, pooled); return kIOReturnNotReady; }
+  uint8_t *ucd = slot.ucd;
+  const uint8_t tag = static_cast<uint8_t> (slot.entry);
+  ucd[0] = 0x16;                      // QUERY REQUEST
+  ucd[3] = tag;
+  ucd[5] = 0x01;                      // standard read request
+  ucd[12] = 0x01;                     // READ DESCRIPTOR
+  ucd[13] = idn;
+  ucd[14] = index;
+  ucd[18] = static_cast<uint8_t> (maxBytes >> 8);
+  ucd[19] = static_cast<uint8_t> (maxBytes);
+  uint32_t ocs = 0xf;
+  IOReturn status = hostSubmit (slot, 0, 0, 500000, &ocs);
+  if (status == kIOReturnSuccess) status = hostResponseHeader (slot, 0x36, 0, tag);
+  if (status == kIOReturnSuccess) {
+    const uint8_t *rsp = ucd + kRspOffset;
+    if (rsp[12] != 0x01 || rsp[13] != idn || rsp[14] != index || rsp[15]) status = hostProtocolError (5);
+    else if (rsp[6] != 0) status = kIOReturnError;
+    else {
+      uint32_t len = (uint32_t (rsp[10]) << 8) | rsp[11];
+      if (len > maxBytes) len = maxBytes;
+      if (len) memcpy (dst, rsp + 32, len);
+      if (actualBytes) *actualBytes = len;
+    }
+  }
+  hostSlotGive (slot, pooled);
+  return status;
+}
+
+// Runtime SCSI command strictly on W-LUN 0xC4 (RPMB): TEST UNIT READY (0x00), SECURITY PROTOCOL IN (0xA2), SECURITY PROTOCOL OUT (0xB5).
+static IOReturn hostRpmbScsi (const uint8_t *cdb, uint32_t cdbLen, unsigned direction, void *buf, uint32_t bytes, uint32_t *scsiStatus)
+{
+  if (!gHost.ready || !cdb || !cdbLen || cdbLen > 16 || direction > 2 || bytes > kDataMax || (bytes & 3) ||
+      (bytes ? (!direction || !buf) : direction)) return kIOReturnBadArgument;
+  if (cdb[0] != 0x00 && cdb[0] != 0xa2 && cdb[0] != 0xb5) return kIOReturnUnsupported;
+  bool pooled;
+  const UfsSlot slot = hostSlotTake (&pooled);
+  if (direction == 1 && bytes) memcpy (slot.data, buf, bytes);
+  uint32_t scsi = 0;
+  IOReturn status;
+  for (unsigned attempt = 0;; ++attempt) {
+    status = hostScsiDir (slot, 0xc4, cdb, cdbLen, direction, bytes, 2000000, &scsi);
+    if (!hostRetryable (status, scsi, attempt)) break;
+  }
+  if (scsiStatus) *scsiStatus = scsi;
+  if (status == kIOReturnSuccess && direction == 2 && bytes) memcpy (buf, slot.data, bytes);
+  hostSlotGive (slot, pooled);
+  return status;
+}
+
