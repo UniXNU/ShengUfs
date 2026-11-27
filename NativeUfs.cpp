@@ -1635,6 +1635,17 @@ extern "C" int native_ufs_store_sync (void)
   return ok;
 }
 
+extern "C" int native_ufs_query_desc (uint8_t idn, uint8_t index, void *dst, uint32_t max_bytes, uint32_t *actual_bytes)
+{
+  return hostQueryReadDesc (idn, index, dst, max_bytes, actual_bytes) == kIOReturnSuccess ? 0 : -1;
+}
+
+extern "C" int native_ufs_rpmb_scsi (const uint8_t *cdb, uint32_t cdb_len, int direction, void *buf, uint32_t bytes, uint32_t *scsi_status)
+{
+  if (direction < 0 || direction > 2) return -1;
+  return hostRpmbScsi (cdb, cdb_len, static_cast<unsigned> (direction), buf, bytes, scsi_status) == kIOReturnSuccess ? 0 : -1;
+}
+
 // ---- Read-only access to other partitions, by GPT name ------------------------------------------------------------
 // The firmware the board's own boot stages left on the modem partition is read from there (the audio DSP's images), so it never has to be
 // part of the boot image. Nothing here writes: only reads of 4096-byte blocks of the LUN the name was found on.
